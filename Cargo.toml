@@ -16,6 +16,11 @@ repository = "https://github.com/alexander-khx/busyncr"
 [workspace.dependencies]
 busyncr-core = { path = "crates/busyncr-core" }
 busyncr-proto = { path = "crates/busyncr-proto" }
+# tonic/prost pinned to the 0.13 line workspace-wide; see
+# crates/busyncr-proto/Cargo.toml for the palette rationale.
+tonic = "0.13"
+prost = "0.13"
+tokio = "1"
 
 [profile.release]
 lto = "thin"

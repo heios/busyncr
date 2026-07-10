@@ -14,11 +14,21 @@ path = "src/lib.rs"
 
 [dependencies]
 busyncr-core.workspace = true
+busyncr-proto.workspace = true
 redb = "4.1"
 # thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
 # error-handling rule mandates "thiserror enums in core/library crates".
 thiserror = "2.0.18"
 ulid = "1.2"
+tonic.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+# tokio-stream is not named in the palette; it is the tokio project's own
+# companion crate (same org/release train as the palette's `tokio`) and is
+# required to adapt tokio primitives (mpsc receivers, TcpListener) into the
+# `Stream`s tonic's streaming RPCs and `serve_with_incoming` consume.
+tokio-stream = { version = "0.1", features = ["net"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

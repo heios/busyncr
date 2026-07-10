@@ -5,3 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Pinned to the 0.13 line: tonic 0.14 moved prost codegen out into
+# tonic-prost / tonic-prost-build, which are not in the approved dependency
+# palette; 0.13 is the newest line where tonic + tonic-build + prost alone
+# (all palette crates) cover generation and runtime.
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build = "0.13"
+protoc-bin-vendored = "3"

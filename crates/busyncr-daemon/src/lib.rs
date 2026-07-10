@@ -6,4 +6,5 @@
 
 #![deny(missing_docs)]
 
+pub mod service;
 pub mod store;

@@ -1,0 +1,114 @@
+// BusyNCR wire protocol (PRD §3.2).
+//
+// One service carries the whole client↔daemon conversation. Chunk IDs are
+// always the raw 32-byte BLAKE3 hash of the chunk plaintext (PRD §3.3);
+// snapshot IDs are the raw 16-byte ULID. Chunk *data* on the wire is opaque
+// to the daemon — from S7 onward it is XChaCha20-Poly1305 ciphertext, the
+// daemon never sees plaintext (PRD §3.4).
+
+syntax = "proto3";
+
+package busyncr.v1;
+
+// The complete BusyNCR daemon API.
+service Busyncr {
+  // Exchange a one-time enrollment token + CSR for a client certificate
+  // signed by the daemon's internal CA (FR1). Implemented in slice S6;
+  // until then the daemon answers UNIMPLEMENTED.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // List all snapshot IDs the daemon holds, oldest first (FR2 groundwork).
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+  // Dedup negotiation: given a batch of chunk IDs, return the subset the
+  // daemon does NOT already store (FR3 groundwork).
+  rpc HasChunks(HasChunksRequest) returns (HasChunksResponse);
+
+  // Client-streamed upload of chunk blobs. Each blob is stored under its
+  // chunk ID; re-uploading an existing chunk is a no-op counted in
+  // `already_present`.
+  rpc UploadChunks(stream ChunkBlob) returns (UploadChunksResponse);
+
+  // Store a snapshot manifest. The manifest must reference only chunks the
+  // daemon already holds (upload chunks first), and the snapshot ID must be
+  // new — manifests are immutable once stored.
+  rpc PutManifest(PutManifestRequest) returns (PutManifestResponse);
+
+  // Fetch a stored manifest by snapshot ID.
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+
+  // Server-streamed download of chunk blobs, in request order. Every blob
+  // is integrity-verified against its content address before it is sent
+  // (FR9 groundwork); corruption aborts the stream with DATA_LOSS.
+  rpc GetChunks(GetChunksRequest) returns (stream ChunkBlob);
+}
+
+// FR1 enrollment (served from S6).
+message EnrollRequest {
+  // One-time enrollment token printed by `busyncr-daemon enroll-token`.
+  string token = 1;
+  // DER-encoded PKCS#10 certificate signing request.
+  bytes csr_der = 2;
+}
+
+message EnrollResponse {
+  // DER-encoded client certificate signed by the daemon CA.
+  bytes cert_der = 1;
+  // DER-encoded daemon CA certificate, for the client's trust store.
+  bytes ca_cert_der = 2;
+}
+
+message ListSnapshotsRequest {}
+
+message ListSnapshotsResponse {
+  // Raw 16-byte snapshot ULIDs, sorted ascending (= chronological).
+  repeated bytes snapshot_ids = 1;
+}
+
+message HasChunksRequest {
+  // Raw 32-byte chunk IDs to probe.
+  repeated bytes chunk_ids = 1;
+}
+
+message HasChunksResponse {
+  // The subset of the request the daemon does not store, request order.
+  repeated bytes missing_chunk_ids = 1;
+}
+
+// One chunk on the wire: its content address plus its (opaque) bytes.
+message ChunkBlob {
+  // Raw 32-byte chunk ID.
+  bytes chunk_id = 1;
+  // The chunk bytes (ciphertext from S7 onward).
+  bytes data = 2;
+}
+
+message UploadChunksResponse {
+  // Blobs newly written by this call.
+  uint64 stored = 1;
+  // Blobs skipped because the daemon already held them.
+  uint64 already_present = 2;
+}
+
+message PutManifestRequest {
+  // Serialized manifest (busyncr-core canonical encoding; encrypted from
+  // S7 onward).
+  bytes manifest = 1;
+}
+
+message PutManifestResponse {}
+
+message GetManifestRequest {
+  // Raw 16-byte snapshot ULID.
+  bytes snapshot_id = 1;
+}
+
+message GetManifestResponse {
+  // The stored manifest blob, byte-identical to what PutManifest received.
+  bytes manifest = 1;
+}
+
+message GetChunksRequest {
+  // Raw 32-byte chunk IDs to fetch; blobs are streamed back in this order.
+  repeated bytes chunk_ids = 1;
+}
