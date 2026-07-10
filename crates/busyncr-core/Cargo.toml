@@ -12,12 +12,21 @@ blake3 = "1.8.5"
 # current stable line.
 chacha20poly1305 = "0.10"
 fastcdc = "4.0.1"
+# lz4_flex is a phase-2 approved dependency (FR-C1 §7): pure-Rust, block
+# mode, used only as the optional `probe+zstd3` policy's ephemeral ratio
+# probe (C2.2) — its output bytes are never stored (C1.4), only their length.
+lz4_flex = "0.11"
 rand = "0.10.2"
 serde = { version = "1", features = ["derive"] }
 # thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
 # error-handling rule mandates "thiserror enums in core/library crates".
 thiserror = "2.0.18"
 ulid = { version = "1.2", features = ["serde"] }
+# zstd is a phase-2 approved dependency (FR-C1 §7): bindgen to libzstd for
+# level parity with the FR-C1 Appendix A reference measurements (pure-Rust
+# implementations do not match libzstd's ratio/level curve exactly). Backs
+# the persistent `codec = zstd` chunk format (C1.1) and its policy engine.
+zstd = "0.13"
 
 [dev-dependencies]
 postcard = { version = "1", features = ["alloc"] }

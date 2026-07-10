@@ -5,6 +5,7 @@
 
 pub mod bench;
 pub mod chunking;
+pub mod compression;
 pub mod crypto;
 pub mod index;
 pub mod manifest;
