@@ -48,7 +48,15 @@ jobs:
             use_cross: true
           - os: ubuntu-latest
             label: linux-riscv64
-            target: riscv64gc-unknown-linux-musl
+            # gnu, not musl: our TLS stack pulls in aws-lc-sys (via
+            # rustls/aws-lc-rs), whose universal pre-generated bindings cover
+            # riscv64gc-unknown-linux-*gnu* but NOT -musl (aws-lc-rs#874), so a
+            # musl build falls back to a full cmake compile. `cross` also ships
+            # a riscv64-gnu image (with a C toolchain) but no musl one, so a
+            # musl target silently degrades to host cargo with no cross-gcc.
+            # The gnu leg is therefore glibc-dynamic rather than static like the
+            # x86_64/aarch64 musl legs; acceptable for this best-effort target.
+            target: riscv64gc-unknown-linux-gnu
             ext: ""
             archive: tar.gz
             rustflags: ""
