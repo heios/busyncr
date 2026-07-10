@@ -1,6 +1,10 @@
 //! BusyNCR core: content-defined chunking, manifests, chunk store, crypto,
 //! retention grid. Pure cross-platform logic — no networking, no OS services.
 
+#![deny(missing_docs)]
+
+pub mod chunking;
+
 /// Crate version, re-exported for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = "1.8.5"
+fastcdc = "4.0.1"
+# thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
+# error-handling rule mandates "thiserror enums in core/library crates".
+thiserror = "2.0.18"
 
 [dev-dependencies]
+rand = "0.10.2"
