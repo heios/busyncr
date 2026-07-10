@@ -48,7 +48,7 @@ FR references point at PRD.md §4.
   groundwork). Store/load/delete + refcount unit tests incl. crash-safety
   (tmp file left behind is ignored/cleaned). Deps: S1.
 
-- [ ] **S4 — Client-side crypto + keyfile.** In core: `DataKey` (32-byte
+- [x] **S4 — Client-side crypto + keyfile.** In core: `DataKey` (32-byte
   random); chunk encryption XChaCha20-Poly1305 (`chacha20poly1305` crate),
   nonce random per blob, AAD = chunk ID; manifest encryption same scheme.
   Keyfile export/import: Argon2id (crate `argon2`) passphrase-derived KEK,
@@ -144,3 +144,4 @@ cargo test --workspace
 | S1    | done   | 4e2fd84 | chunking module in core; fastcdc 4.0.1 caps sizes (min<=1MiB, target<=4MiB, max<=16MiB) — 4M-target bench candidate is the largest valid config |
 | S2    | done   | 8853148 | bench engine in core::bench + core::index (IndexEntry::WIRE_SIZE=48, S3 must reuse); deviations: default N = grid occupancy over a documented 1-year horizon (=36) since the >=16d tier is unbounded; manifest layout constants (header 28 B, per-file fixed 32 B) defined in core::bench — S3 must serialize to match; serde_json added to client (justified in Cargo.toml) for the PRD-mandated --json |
 | S3    | done   | be4f840 | core::manifest (Manifest/FileEntry) + daemon lib with store::ChunkStore (CAS objects/<2hex>/<hex>, tmp+fsync+rename, redb chunks/snapshots tables reusing IndexEntry wire layout, refcounts, typed IntegrityError on read, .tmp- sweep on open); deviation: manifest wire format is a hand-rolled fixed-width LE codec instead of bincode/postcard so encode().len() equals the S2 bench projection constants exactly (types stay serde-derivable; postcard roundtrip covered in dev test); layout constants moved to core::manifest and re-exported from core::bench |
+| S4    | done   | 9395224 | core::crypto: DataKey (injected CryptoRng), XChaCha20-Poly1305 blob format nonce(24)+ct+tag(16), AAD = chunk ID for chunks / snapshot ULID for manifests; keyfile v1 (magic BUSYNCRK, Argon2id KEK m=64MiB/t=3/p=1 default, header incl. KDF params+salt bound as AAD, 109 B); FR6/FR7 groundwork tests; pinned chacha20poly1305 0.10 + argon2 0.5 (0.11/0.6 are rc/unsettled API lines); want: zeroize-on-drop for DataKey (zeroize crate not in palette) |
