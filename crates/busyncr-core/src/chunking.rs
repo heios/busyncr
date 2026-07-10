@@ -5,16 +5,35 @@
 //! loading whole files into memory ([`chunk_reader`]), and an in-memory path
 //! for already-buffered data ([`chunk_bytes`]).
 //!
-//! Every chunk is identified by [`ChunkId`]: the BLAKE3 hash of the chunk's
-//! *plaintext* content, computed client-side before any encryption. Identical
-//! content therefore yields identical IDs across files, snapshots, and time,
-//! which is the foundation of BusyNCR's deduplication (PRD §3.3).
+//! Every chunk is identified by [`ChunkId`], computed client-side before any
+//! encryption. Identical content yields identical IDs across files,
+//! snapshots, and time, which is the foundation of BusyNCR's deduplication
+//! (PRD §3.3).
+//!
+//! # Keyed identity (FR-K1)
+//!
+//! The backup/restore pipeline computes the chunk ID as a *keyed* BLAKE3 hash
+//! under the backup set's secret [`ChunkIdKey`]
+//! ([`ChunkId::keyed`] / [`chunk_reader_keyed`] / [`chunk_bytes_keyed`]).
+//! Keying closes the known-plaintext confirmation channel: a daemon that
+//! already holds a candidate file cannot chunk+hash it and check whether
+//! those IDs exist, because it lacks the key. Dedup scope therefore narrows
+//! from daemon-global to per-backup-set (per key), which is no practical loss
+//! for the single-user model — clients sharing one keyfile still dedup
+//! against each other (FR-K1 §2).
+//!
+//! The unkeyed path ([`ChunkId::of`] / [`chunk_reader`] / [`chunk_bytes`],
+//! plain BLAKE3) is retained for the offline `bench-chunking` tool only:
+//! dedup *ratios* are key-invariant, and the tool must work before any
+//! enrollment exists, so it stays keyless (FR-K1 §2, K1.5). It MUST NOT be
+//! used on the real backup path — that would reopen the confirmation channel.
 
 use std::fmt;
 use std::io::Read;
 use std::str::FromStr;
 
 use fastcdc::v2020;
+use rand::CryptoRng;
 
 /// Smallest permitted `min_size`, inherited from the FastCDC v2020 layer.
 pub const MIN_SIZE_FLOOR: usize = v2020::MINIMUM_MIN;
@@ -55,7 +74,52 @@ pub enum ChunkIdParseError {
     BadChar(char),
 }
 
-/// Identity of a chunk: the BLAKE3 hash of its plaintext content.
+/// Secret 32-byte key that makes chunk identity keyed (FR-K1).
+///
+/// Generated with the data key at backup-set creation, stored in the client
+/// state directory, and carried in the keyfile v2 export, so migration (FR6)
+/// preserves chunk identity — imported history dedups against new backups
+/// exactly as before. Feed it to [`ChunkId::keyed`] on the real backup and
+/// restore paths; the daemon never sees it (chunk IDs stay opaque 32-byte
+/// handles, FR-K1 K1.3).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChunkIdKey([u8; 32]);
+
+impl ChunkIdKey {
+    /// Number of raw bytes in a chunk-ID key.
+    pub const LEN: usize = 32;
+
+    /// Generates a fresh random chunk-ID key from the provided RNG.
+    #[must_use]
+    pub fn generate<R: CryptoRng>(rng: &mut R) -> Self {
+        let mut bytes = [0u8; Self::LEN];
+        rng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
+    /// Wraps existing raw key bytes (e.g. read from local client state).
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Raw key bytes, for persisting into local client state or the keyfile.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ChunkIdKey {
+    /// Redacted: key material must never appear in logs or panics.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ChunkIdKey(..redacted..)")
+    }
+}
+
+/// Identity of a chunk: a 32-byte BLAKE3 hash of its plaintext content,
+/// keyed ([`ChunkId::keyed`], the real pipeline) or unkeyed ([`ChunkId::of`],
+/// the offline bench tool only — see the module docs).
 ///
 /// Computed client-side before encryption, so equal plaintext always maps to
 /// the same ID regardless of file, snapshot, or encryption nonce (PRD §3.3).
@@ -68,10 +132,22 @@ impl ChunkId {
     /// Number of raw bytes in a chunk ID.
     pub const LEN: usize = 32;
 
-    /// Computes the chunk ID of the given plaintext content.
+    /// Computes the *unkeyed* chunk ID (plain BLAKE3) of the given content.
+    ///
+    /// Retained for the offline `bench-chunking` tool only (FR-K1 K1.5); the
+    /// real backup/restore path uses [`ChunkId::keyed`]. Using this on the
+    /// backup path would reopen the known-plaintext confirmation channel.
     #[must_use]
     pub fn of(content: &[u8]) -> Self {
         Self(*blake3::hash(content).as_bytes())
+    }
+
+    /// Computes the *keyed* chunk ID (`blake3::keyed_hash`) of the given
+    /// content under `key` — the identity used on the real backup and restore
+    /// paths (FR-K1 K1.1).
+    #[must_use]
+    pub fn keyed(key: &ChunkIdKey, content: &[u8]) -> Self {
+        Self(*blake3::keyed_hash(key.as_bytes(), content).as_bytes())
     }
 
     /// Wraps raw hash bytes as a chunk ID.
@@ -254,6 +330,9 @@ impl Chunk {
 /// files are never held in memory. Created by [`chunk_reader`].
 pub struct ChunkStream<R: Read> {
     inner: v2020::StreamCDC<R>,
+    /// Keyed identity under this key when `Some`; plain BLAKE3 when `None`
+    /// (the bench-only unkeyed path).
+    id_key: Option<ChunkIdKey>,
 }
 
 impl<R: Read> Iterator for ChunkStream<R> {
@@ -262,7 +341,10 @@ impl<R: Read> Iterator for ChunkStream<R> {
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next()? {
             Ok(cd) => {
-                let id = ChunkId::of(&cd.data);
+                let id = match self.id_key {
+                    Some(ref key) => ChunkId::keyed(key, &cd.data),
+                    None => ChunkId::of(&cd.data),
+                };
                 Some(Ok(Chunk {
                     id,
                     offset: cd.offset,
@@ -277,21 +359,44 @@ impl<R: Read> Iterator for ChunkStream<R> {
     }
 }
 
-/// Chunks a byte stream read incrementally from `source`.
+/// Chunks a byte stream read incrementally from `source`, with **unkeyed**
+/// (plain BLAKE3) chunk IDs.
 ///
 /// Memory use is bounded by `config.max_size()`; the source is read exactly
 /// once, in order. An empty source yields no chunks; a source shorter than
 /// `config.min_size()` yields exactly one chunk.
+///
+/// Unkeyed — for the offline `bench-chunking` tool only (FR-K1 K1.5). The
+/// real backup path uses [`chunk_reader_keyed`].
 pub fn chunk_reader<R: Read>(source: R, config: &ChunkerConfig) -> ChunkStream<R> {
     ChunkStream {
         inner: v2020::StreamCDC::new(source, config.min_size, config.target_size, config.max_size),
+        id_key: None,
     }
 }
 
-/// Chunks an in-memory byte slice.
+/// Chunks a byte stream from `source` with **keyed** chunk IDs under `id_key`
+/// (FR-K1) — the identity the real backup pipeline uses.
+///
+/// Boundaries are identical to [`chunk_reader`] over the same bytes and
+/// config (CDC cut points depend only on content, not the ID hash); only the
+/// [`ChunkId`]s differ.
+pub fn chunk_reader_keyed<R: Read>(
+    source: R,
+    config: &ChunkerConfig,
+    id_key: &ChunkIdKey,
+) -> ChunkStream<R> {
+    ChunkStream {
+        inner: v2020::StreamCDC::new(source, config.min_size, config.target_size, config.max_size),
+        id_key: Some(id_key.clone()),
+    }
+}
+
+/// Chunks an in-memory byte slice with **unkeyed** (plain BLAKE3) chunk IDs.
 ///
 /// Produces exactly the same chunk boundaries and IDs as [`chunk_reader`]
 /// over the same bytes (verified by test); infallible because no I/O occurs.
+/// Unkeyed — bench tool only (FR-K1 K1.5).
 #[must_use]
 pub fn chunk_bytes(data: &[u8], config: &ChunkerConfig) -> Vec<Chunk> {
     v2020::FastCDC::new(data, config.min_size, config.target_size, config.max_size)
@@ -299,6 +404,25 @@ pub fn chunk_bytes(data: &[u8], config: &ChunkerConfig) -> Vec<Chunk> {
             let bytes = &data[c.offset..c.offset + c.length];
             Chunk {
                 id: ChunkId::of(bytes),
+                offset: c.offset as u64,
+                data: bytes.to_vec(),
+            }
+        })
+        .collect()
+}
+
+/// Chunks an in-memory byte slice with **keyed** chunk IDs under `id_key`
+/// (FR-K1).
+///
+/// Same boundaries as [`chunk_bytes`]/[`chunk_reader_keyed`]; only the IDs are
+/// keyed. Matches a [`chunk_reader_keyed`] run over the same bytes.
+#[must_use]
+pub fn chunk_bytes_keyed(data: &[u8], config: &ChunkerConfig, id_key: &ChunkIdKey) -> Vec<Chunk> {
+    v2020::FastCDC::new(data, config.min_size, config.target_size, config.max_size)
+        .map(|c| {
+            let bytes = &data[c.offset..c.offset + c.length];
+            Chunk {
+                id: ChunkId::keyed(id_key, bytes),
                 offset: c.offset as u64,
                 data: bytes.to_vec(),
             }
@@ -497,6 +621,71 @@ mod tests {
         // Multi-byte characters must not slip through the length check.
         let emoji = "🦀".repeat(32);
         assert!(emoji.parse::<ChunkId>().is_err());
+    }
+
+    #[test]
+    fn frk1a_keyed_id_is_deterministic_and_key_separated() {
+        // FR-K1a: same plaintext under the same key → identical IDs
+        // (determinism); under two different keys → different IDs
+        // (key separation), and both differ from the unkeyed BLAKE3.
+        let mut r = StdRng::seed_from_u64(101);
+        let key1 = ChunkIdKey::generate(&mut r);
+        let key2 = ChunkIdKey::generate(&mut r);
+        assert_ne!(key1.as_bytes(), key2.as_bytes());
+
+        let plaintext = b"identical plaintext, different keys".repeat(50);
+        let id1a = ChunkId::keyed(&key1, &plaintext);
+        let id1b = ChunkId::keyed(&key1, &plaintext);
+        let id2 = ChunkId::keyed(&key2, &plaintext);
+        let unkeyed = ChunkId::of(&plaintext);
+
+        assert_eq!(
+            id1a, id1b,
+            "same key + same plaintext must be deterministic"
+        );
+        assert_ne!(id1a, id2, "different keys must yield different IDs");
+        assert_ne!(id1a, unkeyed, "keyed ID must differ from plain BLAKE3");
+        assert_ne!(id2, unkeyed);
+        // Matches BLAKE3's native keyed mode exactly.
+        assert_eq!(
+            id1a.as_bytes(),
+            blake3::keyed_hash(key1.as_bytes(), &plaintext).as_bytes()
+        );
+    }
+
+    #[test]
+    fn frk1a_keyed_reader_bytes_and_id_agree() {
+        // The keyed streaming, in-memory, and single-shot paths must all
+        // produce the same keyed IDs — and differ from the unkeyed path.
+        let data = random_bytes(2 * 1024 * 1024 + 77, 202);
+        let cfg = small_config();
+        let mut r = StdRng::seed_from_u64(303);
+        let key = ChunkIdKey::generate(&mut r);
+
+        let streamed: Vec<Chunk> = chunk_reader_keyed(Cursor::new(data.clone()), &cfg, &key)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let in_memory = chunk_bytes_keyed(&data, &cfg, &key);
+        assert!(in_memory.len() > 1);
+        assert_eq!(streamed, in_memory, "keyed streaming must equal in-memory");
+
+        let unkeyed = chunk_bytes(&data, &cfg);
+        // Same boundaries (offsets/lengths), different IDs.
+        assert_eq!(streamed.len(), unkeyed.len());
+        for (keyed, plain) in streamed.iter().zip(&unkeyed) {
+            assert_eq!(keyed.offset, plain.offset);
+            assert_eq!(keyed.data, plain.data);
+            assert_eq!(keyed.id, ChunkId::keyed(&key, &keyed.data));
+            assert_ne!(keyed.id, plain.id, "keyed and unkeyed IDs must differ");
+        }
+    }
+
+    #[test]
+    fn chunk_id_key_debug_is_redacted() {
+        let mut r = StdRng::seed_from_u64(404);
+        let key = ChunkIdKey::generate(&mut r);
+        assert_eq!(format!("{key:?}"), "ChunkIdKey(..redacted..)");
+        assert_ne!(key.as_bytes(), &[0u8; ChunkIdKey::LEN]);
     }
 
     #[test]

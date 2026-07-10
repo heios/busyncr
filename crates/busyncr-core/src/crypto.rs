@@ -13,14 +13,20 @@
 //! * Wire layout of every encrypted blob: `nonce (24) || ciphertext+tag`,
 //!   i.e. plaintext length + [`BLOB_OVERHEAD`] bytes total.
 //!
-//! # Keyfile (export / migration, FR6)
+//! # Keyfile v2 (export / migration, FR6 + FR-K1)
 //!
-//! The data key is exportable as a passphrase-protected keyfile: a KEK is
-//! derived from the passphrase with Argon2id ([`KdfParams`]), and the data
-//! key is sealed under the KEK with the same AEAD. The whole keyfile header
-//! (magic, version, KDF parameters, salt) is bound as associated data, so
-//! tampering with any header field is detected at import. The format is
-//! versioned via [`KEYFILE_MAGIC`] and [`KEYFILE_VERSION`].
+//! The backup set's secrets are exportable as a passphrase-protected keyfile:
+//! a KEK is derived from the passphrase with Argon2id ([`KdfParams`]), and the
+//! sealed payload — the [`DataKey`] **and** the [`ChunkIdKey`], 64 bytes — is
+//! sealed under the KEK with the same AEAD. Carrying the chunk-ID key means
+//! migration (FR6) preserves chunk identity, so imported history dedups
+//! against new backups exactly as before (FR-K1 K1.2). The whole keyfile
+//! header (magic, version, KDF parameters, salt) is bound as associated data,
+//! so tampering with any header field is detected at import. The format is
+//! versioned via [`KEYFILE_MAGIC`] and [`KEYFILE_VERSION`]; a v1 keyfile
+//! (data key only) is rejected at import with [`CryptoError::KeyfileVersion`]
+//! — no silent misinterpretation (FR-K1 K1.4/K1d). Nothing was released at
+//! v1, so no migration path from it is needed.
 //!
 //! # Randomness
 //!
@@ -33,10 +39,12 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::CryptoRng;
 use ulid::Ulid;
 
-use crate::chunking::ChunkId;
+use crate::chunking::{ChunkId, ChunkIdKey};
 
 /// Length in bytes of a [`DataKey`].
 pub const DATA_KEY_LEN: usize = 32;
+/// Length in bytes of a [`ChunkIdKey`] (mirrors [`ChunkIdKey::LEN`]).
+pub const CHUNK_ID_KEY_LEN: usize = ChunkIdKey::LEN;
 /// Length in bytes of the XChaCha20-Poly1305 nonce prefixed to every blob.
 pub const NONCE_LEN: usize = 24;
 /// Length in bytes of the Poly1305 authentication tag appended to every blob.
@@ -46,17 +54,20 @@ pub const BLOB_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 
 /// Magic bytes opening every BusyNCR keyfile.
 pub const KEYFILE_MAGIC: [u8; 8] = *b"BUSYNCRK";
-/// Current keyfile format version.
-pub const KEYFILE_VERSION: u8 = 1;
+/// Current keyfile format version. v2 seals the data key **and** the chunk-ID
+/// key (FR-K1); v1 (data key only) is rejected at import.
+pub const KEYFILE_VERSION: u8 = 2;
 /// Length in bytes of the Argon2id salt stored in the keyfile.
 pub const KEYFILE_SALT_LEN: usize = 16;
+/// Length of the sealed secret payload: data key followed by chunk-ID key.
+pub const KEYFILE_PAYLOAD_LEN: usize = DATA_KEY_LEN + CHUNK_ID_KEY_LEN;
 /// Keyfile header length: magic (8) + version (1) + m_cost/t_cost/p_cost
 /// (3 × u32 LE) + salt ([`KEYFILE_SALT_LEN`]). The header is the associated
-/// data of the sealed key, so it is tamper-evident.
+/// data of the sealed payload, so it is tamper-evident.
 pub const KEYFILE_HEADER_LEN: usize = 8 + 1 + 4 + 4 + 4 + KEYFILE_SALT_LEN;
-/// Total length in bytes of a version-1 keyfile: header + nonce + sealed key
-/// (data key + tag).
-pub const KEYFILE_LEN: usize = KEYFILE_HEADER_LEN + NONCE_LEN + DATA_KEY_LEN + TAG_LEN;
+/// Total length in bytes of a version-2 keyfile: header + nonce + sealed
+/// payload ([`KEYFILE_PAYLOAD_LEN`] + tag).
+pub const KEYFILE_LEN: usize = KEYFILE_HEADER_LEN + NONCE_LEN + KEYFILE_PAYLOAD_LEN + TAG_LEN;
 
 /// Errors produced by encryption, decryption, and keyfile handling.
 #[derive(Debug, thiserror::Error)]
@@ -265,19 +276,21 @@ fn derive_kek(
     Ok(DataKey::from_bytes(kek))
 }
 
-/// Exports `key` as a passphrase-protected keyfile (FR6, PRD §3.4).
+/// Exports the backup set's `data_key` and `chunk_id_key` as a
+/// passphrase-protected keyfile v2 (FR6 + FR-K1, PRD §3.4).
 ///
-/// Layout (version 1, [`KEYFILE_LEN`] bytes total):
+/// Layout (version 2, [`KEYFILE_LEN`] bytes total):
 ///
 /// ```text
 /// magic (8) | version (1) | m_cost KiB (u32 LE) | t_cost (u32 LE)
 /// | p_cost (u32 LE) | salt (16)          <- header, bound as AAD
-/// | nonce (24) | sealed data key (32 + 16 tag)
+/// | nonce (24) | sealed payload (32 data key + 32 chunk-ID key + 16 tag)
 /// ```
 ///
 /// Salt and nonce are drawn fresh from `rng` on every export.
 pub fn export_keyfile<R: CryptoRng>(
-    key: &DataKey,
+    data_key: &DataKey,
+    chunk_id_key: &ChunkIdKey,
     passphrase: &[u8],
     params: &KdfParams,
     rng: &mut R,
@@ -294,18 +307,27 @@ pub fn export_keyfile<R: CryptoRng>(
     header.extend_from_slice(&params.p_cost.to_le_bytes());
     header.extend_from_slice(&salt);
 
-    let sealed = seal(&kek, &header, key.as_bytes(), rng)?;
+    let mut payload = Vec::with_capacity(KEYFILE_PAYLOAD_LEN);
+    payload.extend_from_slice(data_key.as_bytes());
+    payload.extend_from_slice(chunk_id_key.as_bytes());
+
+    let sealed = seal(&kek, &header, &payload, rng)?;
     let mut file = header;
     file.extend_from_slice(&sealed);
     Ok(file)
 }
 
-/// Imports a keyfile produced by [`export_keyfile`], recovering the data key.
+/// Imports a keyfile v2 produced by [`export_keyfile`], recovering the data
+/// key and the chunk-ID key.
 ///
 /// Fails with [`CryptoError::KeyfileFormat`] / [`CryptoError::KeyfileVersion`]
-/// on structural problems and with [`CryptoError::KeyfileUnlock`] when the
-/// passphrase is wrong or the file was tampered with after export.
-pub fn import_keyfile(bytes: &[u8], passphrase: &[u8]) -> Result<DataKey, CryptoError> {
+/// on structural problems (a v1 keyfile fails with `KeyfileVersion(1)` — no
+/// silent misinterpretation, FR-K1 K1.4) and with [`CryptoError::KeyfileUnlock`]
+/// when the passphrase is wrong or the file was tampered with after export.
+pub fn import_keyfile(
+    bytes: &[u8],
+    passphrase: &[u8],
+) -> Result<(DataKey, ChunkIdKey), CryptoError> {
     if bytes.len() < 9 {
         return Err(CryptoError::KeyfileFormat("file too short"));
     }
@@ -317,7 +339,7 @@ pub fn import_keyfile(bytes: &[u8], passphrase: &[u8]) -> Result<DataKey, Crypto
         return Err(CryptoError::KeyfileVersion(version));
     }
     if bytes.len() != KEYFILE_LEN {
-        return Err(CryptoError::KeyfileFormat("wrong length for version 1"));
+        return Err(CryptoError::KeyfileFormat("wrong length for version 2"));
     }
 
     let read_u32 = |offset: usize| -> Result<u32, CryptoError> {
@@ -340,16 +362,25 @@ pub fn import_keyfile(bytes: &[u8], passphrase: &[u8]) -> Result<DataKey, Crypto
     let header = &bytes[..KEYFILE_HEADER_LEN];
     let sealed = &bytes[KEYFILE_HEADER_LEN..];
     let kek = derive_kek(passphrase, &salt, &params)?;
-    let key_bytes = open(&kek, header, sealed).map_err(|e| match e {
+    let payload = open(&kek, header, sealed).map_err(|e| match e {
         // Any authentication failure here means wrong passphrase or a
         // tampered/corrupted keyfile; surface the dedicated variant.
         CryptoError::Decrypt | CryptoError::BlobTooShort { .. } => CryptoError::KeyfileUnlock,
         other => other,
     })?;
-    let arr: [u8; DATA_KEY_LEN] = key_bytes
-        .try_into()
-        .map_err(|_| CryptoError::KeyfileFormat("sealed payload is not a 32-byte key"))?;
-    Ok(DataKey::from_bytes(arr))
+    if payload.len() != KEYFILE_PAYLOAD_LEN {
+        return Err(CryptoError::KeyfileFormat(
+            "sealed payload is not a 64-byte data key + chunk-ID key",
+        ));
+    }
+    let mut data_key = [0u8; DATA_KEY_LEN];
+    data_key.copy_from_slice(&payload[..DATA_KEY_LEN]);
+    let mut chunk_id_key = [0u8; CHUNK_ID_KEY_LEN];
+    chunk_id_key.copy_from_slice(&payload[DATA_KEY_LEN..]);
+    Ok((
+        DataKey::from_bytes(data_key),
+        ChunkIdKey::from_bytes(chunk_id_key),
+    ))
 }
 
 #[cfg(test)]
@@ -481,27 +512,68 @@ mod tests {
     }
 
     #[test]
-    fn fr6_keyfile_export_reimports_identical_key() {
-        // FR6 groundwork: export on machine A, import on machine B → same key.
+    fn frk1d_keyfile_v2_roundtrip_carries_both_keys() {
+        // FR-K1d + FR6: export on machine A, import on machine B → both the
+        // data key and the chunk-ID key come back identical, so migrated
+        // history both decrypts (data key) and dedups (chunk-ID key).
         let mut r = rng(12);
-        let key = DataKey::generate(&mut r);
-        let file = export_keyfile(&key, b"correct horse battery staple", &TEST_KDF, &mut r)
-            .expect("export");
+        let data_key = DataKey::generate(&mut r);
+        let chunk_id_key = ChunkIdKey::generate(&mut r);
+        let file = export_keyfile(
+            &data_key,
+            &chunk_id_key,
+            b"correct horse battery staple",
+            &TEST_KDF,
+            &mut r,
+        )
+        .expect("export");
         assert_eq!(file.len(), KEYFILE_LEN);
-        let imported = import_keyfile(&file, b"correct horse battery staple").expect("import");
-        assert_eq!(imported.as_bytes(), key.as_bytes());
-        // The imported key actually decrypts data sealed by the original.
+        assert_eq!(file[8], KEYFILE_VERSION, "keyfile must declare version 2");
+
+        let (imported_data, imported_chunk) =
+            import_keyfile(&file, b"correct horse battery staple").expect("import");
+        assert_eq!(imported_data.as_bytes(), data_key.as_bytes());
+        assert_eq!(imported_chunk.as_bytes(), chunk_id_key.as_bytes());
+        // The imported data key actually decrypts data sealed by the original.
         let plaintext = b"cross-machine history".to_vec();
-        let id = ChunkId::of(&plaintext);
-        let blob = encrypt_chunk(&key, &id, &plaintext, &mut r).unwrap();
-        assert_eq!(decrypt_chunk(&imported, &id, &blob).unwrap(), plaintext);
+        let id = ChunkId::keyed(&chunk_id_key, &plaintext);
+        let blob = encrypt_chunk(&data_key, &id, &plaintext, &mut r).unwrap();
+        assert_eq!(
+            decrypt_chunk(&imported_data, &id, &blob).unwrap(),
+            plaintext
+        );
+        // ...and the imported chunk-ID key reproduces the same keyed identity.
+        assert_eq!(ChunkId::keyed(&imported_chunk, &plaintext), id);
+    }
+
+    #[test]
+    fn frk1d_v1_keyfile_is_rejected_with_versioned_error() {
+        // FR-K1d: a v1 keyfile (magic BUSYNCRK, version byte 1, data key only)
+        // must fail import with a clear versioned error — never silently
+        // misinterpreted as v2.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&KEYFILE_MAGIC);
+        v1.push(1); // version 1
+        v1.extend_from_slice(&TEST_KDF.m_cost_kib.to_le_bytes());
+        v1.extend_from_slice(&TEST_KDF.t_cost.to_le_bytes());
+        v1.extend_from_slice(&TEST_KDF.p_cost.to_le_bytes());
+        v1.extend_from_slice(&[0x11u8; KEYFILE_SALT_LEN]);
+        // A v1-length sealed body (24 nonce + 32 key + 16 tag) — its exact
+        // contents are irrelevant; the version check must fire first.
+        v1.extend_from_slice(&[0u8; NONCE_LEN + DATA_KEY_LEN + TAG_LEN]);
+        assert!(matches!(
+            import_keyfile(&v1, b"pw"),
+            Err(CryptoError::KeyfileVersion(1))
+        ));
     }
 
     #[test]
     fn fr6_wrong_passphrase_fails_cleanly() {
         let mut r = rng(13);
-        let key = DataKey::generate(&mut r);
-        let file = export_keyfile(&key, b"right", &TEST_KDF, &mut r).expect("export");
+        let data_key = DataKey::generate(&mut r);
+        let chunk_id_key = ChunkIdKey::generate(&mut r);
+        let file =
+            export_keyfile(&data_key, &chunk_id_key, b"right", &TEST_KDF, &mut r).expect("export");
         assert!(matches!(
             import_keyfile(&file, b"wrong"),
             Err(CryptoError::KeyfileUnlock)
@@ -511,8 +583,10 @@ mod tests {
     #[test]
     fn keyfile_rejects_bad_magic_version_and_length() {
         let mut r = rng(14);
-        let key = DataKey::generate(&mut r);
-        let file = export_keyfile(&key, b"pw", &TEST_KDF, &mut r).expect("export");
+        let data_key = DataKey::generate(&mut r);
+        let chunk_id_key = ChunkIdKey::generate(&mut r);
+        let file =
+            export_keyfile(&data_key, &chunk_id_key, b"pw", &TEST_KDF, &mut r).expect("export");
 
         let mut bad_magic = file.clone();
         bad_magic[0] ^= 0xFF;
@@ -545,8 +619,10 @@ mod tests {
         // Weakening the stored KDF parameters (or salt) after export must
         // fail import: the header is bound as associated data.
         let mut r = rng(15);
-        let key = DataKey::generate(&mut r);
-        let file = export_keyfile(&key, b"pw", &TEST_KDF, &mut r).expect("export");
+        let data_key = DataKey::generate(&mut r);
+        let chunk_id_key = ChunkIdKey::generate(&mut r);
+        let file =
+            export_keyfile(&data_key, &chunk_id_key, b"pw", &TEST_KDF, &mut r).expect("export");
         for pos in [9usize, 13, 17, 21] {
             let mut bad = file.clone();
             bad[pos] ^= 0x01;
@@ -564,10 +640,19 @@ mod tests {
     fn keyfile_default_params_roundtrip() {
         // Production-strength Argon2id parameters work end to end.
         let mut r = rng(16);
-        let key = DataKey::generate(&mut r);
-        let file = export_keyfile(&key, b"pw", &KdfParams::default(), &mut r).expect("export");
-        let imported = import_keyfile(&file, b"pw").expect("import");
-        assert_eq!(imported.as_bytes(), key.as_bytes());
+        let data_key = DataKey::generate(&mut r);
+        let chunk_id_key = ChunkIdKey::generate(&mut r);
+        let file = export_keyfile(
+            &data_key,
+            &chunk_id_key,
+            b"pw",
+            &KdfParams::default(),
+            &mut r,
+        )
+        .expect("export");
+        let (imported_data, imported_chunk) = import_keyfile(&file, b"pw").expect("import");
+        assert_eq!(imported_data.as_bytes(), data_key.as_bytes());
+        assert_eq!(imported_chunk.as_bytes(), chunk_id_key.as_bytes());
     }
 
     #[test]
