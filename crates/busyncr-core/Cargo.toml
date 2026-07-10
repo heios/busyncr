@@ -5,8 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# argon2 0.6 is still a release candidate; 0.5 is the current stable line.
+argon2 = "0.5"
 blake3 = "1.8.5"
+# chacha20poly1305 0.11 tracks the not-yet-settled aead 0.6 API; 0.10 is the
+# current stable line.
+chacha20poly1305 = "0.10"
 fastcdc = "4.0.1"
+rand = "0.10.2"
 serde = { version = "1", features = ["derive"] }
 # thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
 # error-handling rule mandates "thiserror enums in core/library crates".
@@ -15,5 +21,4 @@ ulid = { version = "1.2", features = ["serde"] }
 
 [dev-dependencies]
 postcard = { version = "1", features = ["alloc"] }
-rand = "0.10.2"
 tempfile = "3"
