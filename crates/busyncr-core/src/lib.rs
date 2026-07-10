@@ -8,6 +8,7 @@ pub mod chunking;
 pub mod crypto;
 pub mod index;
 pub mod manifest;
+pub mod retention;
 
 /// Crate version, re-exported for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use busyncr_core::retention::RetentionPolicy;
 use busyncr_daemon::identity::{DaemonIdentity, CA_CERT_FILE};
 use busyncr_daemon::store::ChunkStore;
 use clap::{Parser, Subcommand};
@@ -56,6 +57,32 @@ enum Command {
         /// Enrollment name (the CSR Common Name shown at enrollment).
         name: String,
     },
+
+    /// Apply the retention grid, dropping over-retained snapshots (FR5).
+    ///
+    /// Uses the PRD §3.5 default grid (3 h / 24 h / 4 d / 16 d cells). Drops
+    /// each pruned snapshot's manifest and decrements chunk refcounts; run
+    /// `gc` afterwards to reclaim the freed chunks.
+    Prune {
+        /// Chunk store root directory.
+        #[arg(long)]
+        store: PathBuf,
+    },
+
+    /// Garbage-collect chunks with zero live references (FR5).
+    ///
+    /// A chunk is only reclaimed after it has been continuously unreferenced
+    /// for the grace period, so a concurrent backup's just-uploaded (not yet
+    /// manifested) chunks are never swept.
+    Gc {
+        /// Chunk store root directory.
+        #[arg(long)]
+        store: PathBuf,
+        /// Grace period in seconds a chunk must stay zero-ref before it is
+        /// reclaimed.
+        #[arg(long, default_value_t = 3600)]
+        grace_secs: u64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -64,6 +91,8 @@ fn main() -> anyhow::Result<()> {
         Command::Serve { store, listen } => serve(store, listen),
         Command::EnrollToken { store } => enroll_token(&store),
         Command::Revoke { store, name } => revoke(&store, &name),
+        Command::Prune { store } => prune(&store),
+        Command::Gc { store, grace_secs } => gc(&store, grace_secs),
     }
 }
 
@@ -130,5 +159,51 @@ fn revoke(store_root: &std::path::Path, name: &str) -> anyhow::Result<()> {
         .with_context(|| format!("revoking client {name:?}"))?;
     anyhow::ensure!(count > 0, "no active enrolled client named {name:?}");
     println!("revoked {count} certificate(s) enrolled as {name:?}");
+    Ok(())
+}
+
+/// Whole seconds since the Unix epoch, or 0 if the clock predates it.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// `prune` subcommand (FR5): apply the default retention grid at the wall
+/// clock. The clock is injected here at the binary edge; the store's prune is
+/// deterministic given `now`.
+fn prune(store_root: &std::path::Path) -> anyhow::Result<()> {
+    let store = ChunkStore::open(store_root)
+        .with_context(|| format!("opening chunk store at {}", store_root.display()))?;
+    let outcome = store
+        .prune(now_ms(), &RetentionPolicy::default_grid())
+        .context("applying retention grid")?;
+    println!(
+        "prune complete: kept {} snapshot(s), dropped {}",
+        outcome.kept.len(),
+        outcome.dropped.len()
+    );
+    for snapshot in &outcome.dropped {
+        println!("  dropped {snapshot}");
+    }
+    println!("run `busyncr-daemon gc` to reclaim now-unreferenced chunks");
+    Ok(())
+}
+
+/// `gc` subcommand (FR5): reclaim chunks that have been unreferenced longer
+/// than the grace period.
+fn gc(store_root: &std::path::Path, grace_secs: u64) -> anyhow::Result<()> {
+    let store = ChunkStore::open(store_root)
+        .with_context(|| format!("opening chunk store at {}", store_root.display()))?;
+    let outcome = store
+        .gc(now_ms(), std::time::Duration::from_secs(grace_secs))
+        .context("garbage-collecting unreferenced chunks")?;
+    println!(
+        "gc complete: reclaimed {} chunk(s) ({} bytes); {} chunk(s) marked and awaiting grace",
+        outcome.reclaimed.len(),
+        outcome.bytes_reclaimed,
+        outcome.pending
+    );
     Ok(())
 }

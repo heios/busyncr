@@ -44,13 +44,16 @@
 //! never silent. (End-to-end plaintext verification against the chunk ID
 //! happens on the client after decryption, where the plaintext exists.)
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use busyncr_core::chunking::ChunkId;
 use busyncr_core::index::IndexEntry;
 use busyncr_core::manifest::{Manifest, ManifestError};
+use busyncr_core::retention::{self, RetentionPolicy};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use ulid::Ulid;
 
@@ -62,6 +65,13 @@ const SNAPSHOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("snapshots
 /// IDs (manifest order, duplicates included). The daemon's only view of a
 /// snapshot's chunk usage once manifests are encrypted (S7).
 const SNAPSHOT_REFS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("snapshot_refs");
+/// GC grace-mark table: 32-byte chunk ID → 8-byte LE `i64` timestamp (ms)
+/// recording when the chunk was first observed at refcount zero. A chunk is
+/// only reclaimed by [`ChunkStore::gc`] once it has been continuously
+/// zero-ref for at least the grace period (PRD §3.3 "safe under concurrent
+/// backup"). Marks for chunks that regain a reference are dropped, resetting
+/// the timer.
+const GC_MARKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("gc_marks");
 
 /// Byte length of the BLAKE3-of-blob header prefixed to every object file.
 const OBJECT_HEADER_LEN: usize = 32;
@@ -218,6 +228,7 @@ impl ChunkStore {
             txn.open_table(CHUNKS)?;
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(SNAPSHOT_REFS)?;
+            txn.open_table(GC_MARKS)?;
         }
         txn.commit()?;
 
@@ -654,6 +665,200 @@ impl ChunkStore {
             Err(e) => Err(StoreError::io(&path, e)),
         }
     }
+
+    /// Applies the retention grid (PRD §3.5) at instant `now_ms`: drops every
+    /// snapshot the plan prunes, decrementing chunk refcounts (via
+    /// [`Self::delete_snapshot`]). Chunk blobs are left for [`Self::gc`] to
+    /// reclaim once their grace period elapses.
+    ///
+    /// Snapshot times are derived from their ULID timestamps — the daemon's
+    /// only, decryption-free view of when a snapshot was taken (PRD §3.4). The
+    /// planning itself is the pure, injected-clock
+    /// [`busyncr_core::retention::plan`], so prune is deterministic given
+    /// `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if listing or deleting a snapshot fails. A
+    /// snapshot that vanishes between planning and deletion (concurrent
+    /// prune) is treated as already pruned, not an error.
+    pub fn prune(&self, now_ms: i64, policy: &RetentionPolicy) -> Result<PruneOutcome, StoreError> {
+        let snapshots = self.list_snapshots()?;
+        let items: Vec<(i64, Ulid)> = snapshots.iter().map(|&u| (ulid_time_ms(u), u)).collect();
+        let plan = retention::plan(now_ms, &items, policy);
+        for &snapshot in &plan.drop {
+            match self.delete_snapshot(snapshot) {
+                Ok(()) => {}
+                // Lost a race with another pruner; the snapshot is already
+                // gone, which is the outcome we wanted.
+                Err(StoreError::SnapshotNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(PruneOutcome {
+            kept: plan.keep,
+            dropped: plan.drop,
+        })
+    }
+
+    /// Reclaims unreferenced chunks that have been zero-ref for longer than
+    /// `grace`, at instant `now_ms` (PRD §3.3 GC).
+    ///
+    /// # Grace period & concurrency safety
+    ///
+    /// GC is mark-and-sweep against the [`GC_MARKS`] table. On each run every
+    /// currently zero-ref chunk that is not yet marked is stamped with
+    /// `now_ms`; a marked chunk is only deleted once `now_ms - mark >= grace`.
+    /// A chunk that regains a reference has its mark dropped, resetting the
+    /// timer. This protects a concurrent backup's window between
+    /// `UploadChunks` (chunk lands at refcount 0) and `PutManifest` (refcount
+    /// bumped): as long as the backup completes within `grace`, its freshly
+    /// uploaded chunks are never swept.
+    ///
+    /// The mark/sweep index mutations run in a single `redb` write
+    /// transaction, so refcounts are read and chunks removed atomically —
+    /// a `put_snapshot` that references a chunk either commits fully before
+    /// this transaction (the chunk then has refcount > 0 and is spared) or
+    /// fully after it. Blob files are unlinked only after the index commit,
+    /// so a crash mid-sweep leaves at most a harmless orphan blob, never an
+    /// index entry pointing at a deleted file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Index`] if the index cannot be read or written,
+    /// or [`StoreError::Io`] if a reclaimed blob file cannot be removed.
+    pub fn gc(&self, now_ms: i64, grace: Duration) -> Result<GcOutcome, StoreError> {
+        let grace_ms = i64::try_from(grace.as_millis()).unwrap_or(i64::MAX);
+
+        let mut pending = 0usize;
+
+        let txn = self.db.begin_write()?;
+        let reclaimed: Vec<(ChunkId, u64)> = {
+            let mut chunks = txn.open_table(CHUNKS)?;
+            let mut marks = txn.open_table(GC_MARKS)?;
+
+            // Snapshot current chunk refcounts and existing grace marks.
+            let mut entries: HashMap<ChunkId, IndexEntry> = HashMap::new();
+            for item in chunks.iter()? {
+                let (key, value) = item?;
+                if let Some(id) = chunk_id_from_key(key.value()) {
+                    entries.insert(id, decode_entry(value.value()));
+                }
+            }
+            let mut existing: HashMap<ChunkId, i64> = HashMap::new();
+            for item in marks.iter()? {
+                let (key, value) = item?;
+                if let Some(id) = chunk_id_from_key(key.value()) {
+                    existing.insert(id, decode_mark(value.value()));
+                }
+            }
+
+            let mut to_delete: Vec<(ChunkId, u64)> = Vec::new();
+            let mut marks_to_remove: Vec<ChunkId> = Vec::new();
+            let mut marks_to_insert: Vec<ChunkId> = Vec::new();
+
+            // Reconcile existing marks against current refcounts.
+            for (&id, &marked_at) in &existing {
+                match entries.get(&id) {
+                    Some(entry) if entry.refcount == 0 => {
+                        if now_ms.saturating_sub(marked_at) >= grace_ms {
+                            to_delete.push((id, entry.chunk_len));
+                            marks_to_remove.push(id);
+                        } else {
+                            pending += 1;
+                        }
+                    }
+                    // Referenced again, or the chunk is gone: drop the mark.
+                    _ => marks_to_remove.push(id),
+                }
+            }
+            // Mark newly zero-ref chunks so their grace timer starts now.
+            for (&id, entry) in &entries {
+                if entry.refcount == 0 && !existing.contains_key(&id) {
+                    marks_to_insert.push(id);
+                    pending += 1;
+                }
+            }
+
+            for (id, _) in &to_delete {
+                chunks.remove(id.as_bytes().as_slice())?;
+            }
+            for id in &marks_to_remove {
+                marks.remove(id.as_bytes().as_slice())?;
+            }
+            let now_bytes = now_ms.to_le_bytes();
+            for id in &marks_to_insert {
+                marks.insert(id.as_bytes().as_slice(), now_bytes.as_slice())?;
+            }
+            to_delete
+        };
+        txn.commit()?;
+
+        // Unlink reclaimed blobs after the index commit (crash-safe).
+        let mut bytes_reclaimed = 0u64;
+        let mut ids = Vec::with_capacity(reclaimed.len());
+        for (id, len) in reclaimed {
+            let path = self.object_path(&id);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(&path, e)),
+            }
+            bytes_reclaimed += len;
+            ids.push(id);
+        }
+        Ok(GcOutcome {
+            reclaimed: ids,
+            bytes_reclaimed,
+            pending,
+        })
+    }
+}
+
+/// Outcome of [`ChunkStore::prune`]: which snapshots survived the retention
+/// grid and which were dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneOutcome {
+    /// Snapshots retained by the grid.
+    pub kept: Vec<Ulid>,
+    /// Snapshots pruned (their manifests removed, refcounts decremented).
+    pub dropped: Vec<Ulid>,
+}
+
+/// Outcome of [`ChunkStore::gc`]: chunks reclaimed this run and those still
+/// serving out their grace period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcOutcome {
+    /// Chunks whose index entry and blob were deleted.
+    pub reclaimed: Vec<ChunkId>,
+    /// Total stored-blob bytes reclaimed (sum of the deleted chunks' lengths).
+    pub bytes_reclaimed: u64,
+    /// Zero-ref chunks marked but still within the grace period (not yet
+    /// reclaimed this run).
+    pub pending: usize,
+}
+
+/// Snapshot creation time in milliseconds since the Unix epoch, read from its
+/// ULID (the daemon's decryption-free time source), clamped into `i64`.
+fn ulid_time_ms(id: Ulid) -> i64 {
+    i64::try_from(id.timestamp_ms()).unwrap_or(i64::MAX)
+}
+
+/// Interprets a redb key as a 32-byte chunk ID, or `None` if it is the wrong
+/// width (defensive against a tampered database).
+fn chunk_id_from_key(raw: &[u8]) -> Option<ChunkId> {
+    let bytes: [u8; ChunkId::LEN] = raw.try_into().ok()?;
+    Some(ChunkId::from_bytes(bytes))
+}
+
+/// Decodes an 8-byte LE grace-mark timestamp; a malformed width yields 0
+/// (treated as "marked at the epoch", i.e. immediately past grace).
+fn decode_mark(raw: &[u8]) -> i64 {
+    let mut bytes = [0u8; 8];
+    if raw.len() == 8 {
+        bytes.copy_from_slice(raw);
+    }
+    i64::from_le_bytes(bytes)
 }
 
 /// Decodes an [`IndexEntry`] from a redb value slice; a malformed length
