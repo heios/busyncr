@@ -445,6 +445,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The wire message limit must fit the largest chunk any supported
+    /// chunker configuration can emit (16 MiB CDC ceiling), plus the AEAD
+    /// overhead and generous slack for protobuf framing — otherwise
+    /// `UploadChunks`/`GetChunks` fail exactly on max-size chunks
+    /// (regression guard for the tonic 4 MiB default that broke
+    /// `--default-chunking`).
+    #[test]
+    fn grpc_message_limit_fits_largest_chunk_blob() {
+        use busyncr_core::chunking::MAX_SIZE_CEILING;
+        use busyncr_core::crypto::BLOB_OVERHEAD;
+        const FRAMING_SLACK: usize = 64 * 1024;
+        const {
+            assert!(
+                busyncr_proto::MAX_MESSAGE_SIZE >= MAX_SIZE_CEILING + BLOB_OVERHEAD + FRAMING_SLACK,
+                "MAX_MESSAGE_SIZE cannot carry a max-size chunk blob plus AEAD overhead and framing"
+            );
+        }
+    }
+
     #[test]
     fn collect_files_is_sorted_prefixed_and_skips_non_files() {
         let dir = tempfile::tempdir().unwrap();

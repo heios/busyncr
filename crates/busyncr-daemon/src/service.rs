@@ -133,9 +133,17 @@ impl BusyncrService {
 
     /// Wraps this service in the tonic-generated server type, ready to be
     /// added to a `tonic::transport::Server`.
+    ///
+    /// Raises tonic's 4 MiB default message limit to
+    /// [`busyncr_proto::MAX_MESSAGE_SIZE`]: a single legal `ChunkBlob` can
+    /// carry a 16 MiB max-size chunk (4 MiB already at the 1 MiB default
+    /// target) plus AEAD overhead, which the default would reject
+    /// mid-upload.
     #[must_use]
     pub fn into_server(self) -> BusyncrServer<Self> {
         BusyncrServer::new(self)
+            .max_decoding_message_size(busyncr_proto::MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(busyncr_proto::MAX_MESSAGE_SIZE)
     }
 
     /// Runs a store operation on the blocking pool (redb + file I/O must not

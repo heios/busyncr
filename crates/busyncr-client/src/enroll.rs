@@ -37,10 +37,21 @@ use std::path::{Path, PathBuf};
 use busyncr_core::crypto::DataKey;
 use busyncr_proto::v1::busyncr_client::BusyncrClient;
 use busyncr_proto::v1::{EnrollRequest, EnrollResponse};
-use busyncr_proto::TLS_SERVER_NAME;
+use busyncr_proto::{MAX_MESSAGE_SIZE, TLS_SERVER_NAME};
 use rand::CryptoRng;
 use rcgen::{CertificateParams, DnType, KeyPair};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+/// Applies the protocol-wide message-size limits to a client stub
+/// ([`busyncr_proto::MAX_MESSAGE_SIZE`]): tonic's 4 MiB decode default is
+/// smaller than a single legal chunk blob (max chunk size + AEAD overhead),
+/// so every stub — upload and the S8 restore/download path alike — must
+/// raise it or large-chunk transfers abort mid-stream.
+fn with_message_limits(client: BusyncrClient<Channel>) -> BusyncrClient<Channel> {
+    client
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE)
+}
 
 /// File name of the client TLS private key inside the state directory.
 pub const CLIENT_KEY_FILE: &str = "client-key.pem";
@@ -155,7 +166,7 @@ pub async fn request_enrollment(req: &EnrollmentRequest) -> Result<EnrolledIdent
         .connect()
         .await?;
 
-    let response: EnrollResponse = BusyncrClient::new(channel)
+    let response: EnrollResponse = with_message_limits(BusyncrClient::new(channel))
         .enroll(EnrollRequest {
             token: req.token.clone(),
             csr_pem,
@@ -280,7 +291,7 @@ pub async fn connect_authenticated(
         .tls_config(tls)?
         .connect()
         .await?;
-    Ok(BusyncrClient::new(channel))
+    Ok(with_message_limits(BusyncrClient::new(channel)))
 }
 
 /// Opens a TLS channel that trusts `ca_cert_pem` but presents **no** client
@@ -301,7 +312,7 @@ pub async fn connect_unauthenticated(
         .tls_config(tls)?
         .connect()
         .await?;
-    Ok(BusyncrClient::new(channel))
+    Ok(with_message_limits(BusyncrClient::new(channel)))
 }
 
 /// Writes `data` atomically (tmp + rename); `restrict` narrows permissions

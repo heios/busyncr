@@ -21,7 +21,7 @@ use busyncr_core::manifest::Manifest;
 use busyncr_daemon::identity::DaemonIdentity;
 use busyncr_daemon::service;
 use busyncr_daemon::store::ChunkStore;
-use busyncr_proto::v1::{GetManifestRequest, ListSnapshotsRequest};
+use busyncr_proto::v1::{GetChunksRequest, GetManifestRequest, ListSnapshotsRequest};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use ulid::Ulid;
@@ -78,7 +78,19 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Fixture with the standard 4 KiB test chunking (many chunks from small
+    /// files).
     async fn new(base: &Path) -> Self {
+        Self::with_chunking(base, Some("chunk_target_size = \"4K\"\n"), false).await
+    }
+
+    /// Fixture exercising the `--default-chunking` path: no committed size
+    /// in the config, the 1 MiB default accepted explicitly.
+    async fn new_default_chunking(base: &Path) -> Self {
+        Self::with_chunking(base, None, true).await
+    }
+
+    async fn with_chunking(base: &Path, chunk_line: Option<&str>, allow_default: bool) -> Self {
         let daemon = TlsDaemon::spawn(base).await;
         let state = base.join("client-state");
 
@@ -106,20 +118,22 @@ impl Fixture {
         std::fs::write(root.join("notes").join("hello.txt"), b"hello busyncr\n").unwrap();
 
         // The folder walk + chunk size come from a real TOML config file
-        // (FR2: "a configured folder tree"). 4 KiB target so the 300 KiB
-        // file spans many chunks.
+        // (FR2: "a configured folder tree"). The default 4 KiB target makes
+        // the 300 KiB file span many chunks; `chunk_line = None` leaves the
+        // size uncommitted so `allow_default` exercises --default-chunking.
         let config_path = base.join("busyncr-client.toml");
         std::fs::write(
             &config_path,
             format!(
-                "daemon = \"{}\"\nfolders = [\"src/data\"]\nchunk_target_size = \"4K\"\n",
-                daemon.url
+                "daemon = \"{}\"\nfolders = [\"src/data\"]\n{}",
+                daemon.url,
+                chunk_line.unwrap_or("")
             ),
         )
         .unwrap();
         let config = ClientConfig::load(&config_path).unwrap();
         assert_eq!(config.folders, vec![root.clone()]);
-        let chunker = config.chunker(false).unwrap();
+        let chunker = config.chunker(allow_default).unwrap();
 
         Self {
             daemon,
@@ -349,6 +363,99 @@ async fn fr3_second_backup_ships_only_changed_chunks_byte_accounted() {
     assert_eq!(report3.upload_bytes, 0);
     assert_eq!(report3.chunks_deduped, report3.chunks_unique);
     assert_eq!(fx.list_snapshots().await.len(), 3);
+
+    fx.daemon.stop().await;
+}
+
+/// Regression (S7 fix round 1): a max-size chunk's encrypted blob exceeds
+/// tonic's built-in 4 MiB message limit. At the spec-mandated 1 MiB
+/// `--default-chunking` target any ≥4 MiB boundary-free run — zero runs are
+/// commonplace: sparse files, VM images, DB preallocation — emits
+/// 4,194,304-byte chunks, so backup at the *default* configuration aborted
+/// mid-upload with `OutOfRange` before the stubs raised the limit
+/// (`busyncr_proto::MAX_MESSAGE_SIZE`). Drives the full pipeline over real
+/// mTLS with such data, then pulls the oversized blob back through
+/// `GetChunks` (the S8 restore path decodes on the client side and hits the
+/// same wall).
+#[tokio::test]
+async fn fr2_default_chunking_backs_up_max_size_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fx = Fixture::new_default_chunking(dir.path()).await;
+
+    // 1 MiB default target → 4 MiB max chunk; its ciphertext must exceed
+    // the old 4 MiB wire limit or this test would not cover the regression.
+    assert_eq!(fx.chunker.target_size(), 1024 * 1024);
+    assert_eq!(fx.chunker.max_size(), 4 * 1024 * 1024);
+    assert!(
+        fx.chunker.max_size() + BLOB_OVERHEAD > 4 * 1024 * 1024,
+        "max-size chunk blob must be larger than tonic's default limit"
+    );
+
+    // 12 MiB of zeros (no CDC boundary anywhere) plus a random tail: three
+    // max-size all-zero chunks (a single unique ID) followed by ordinary
+    // content.
+    let mut data = vec![0u8; 12 * 1024 * 1024 + 512 * 1024];
+    StdRng::seed_from_u64(99).fill_bytes(&mut data[12 * 1024 * 1024..]);
+    std::fs::write(fx.root.join("vm.img"), &data).unwrap();
+
+    let local = fx.local_chunks();
+    let max_chunk = local
+        .iter()
+        .find(|(_, len)| *len == fx.chunker.max_size())
+        .map(|(id, _)| *id)
+        .expect("corpus must produce at least one max-size chunk");
+    let unique: HashSet<ChunkId> = local.iter().map(|(id, _)| *id).collect();
+
+    // The backup must survive shipping >4 MiB blobs (this aborted with
+    // BackupError::Rpc(OutOfRange) before the fix) and keep the exact
+    // FR3 byte ledger.
+    let report = fx.backup(1).await;
+    assert_eq!(report.files, 4);
+    assert_eq!(report.chunks_unique, unique.len() as u64);
+    assert_eq!(report.chunks_uploaded, unique.len() as u64);
+    assert_eq!(report.upload_bytes, expected_upload_bytes(&local, &unique));
+    assert_eq!(fx.list_snapshots().await, vec![report.snapshot_id]);
+
+    // The manifest round-trips and records the boundary-free file exactly.
+    let key = enroll::load_data_key(&fx.state).unwrap();
+    let blob = fx.fetch_manifest_blob(report.snapshot_id).await;
+    let plaintext = crypto::decrypt_manifest(&key, report.snapshot_id, &blob).unwrap();
+    let manifest = Manifest::decode(&plaintext).unwrap();
+    let vm = manifest
+        .files
+        .iter()
+        .find(|f| f.path == "data/vm.img")
+        .expect("vm.img must be in the manifest");
+    assert_eq!(vm.size, data.len() as u64);
+    let expected_ids: Vec<ChunkId> = chunk_bytes(&data, &fx.chunker)
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(vm.chunks, expected_ids);
+
+    // Download direction (what S8 restore will do): the oversized blob must
+    // also fit through the client-side decode of the GetChunks stream and
+    // decrypt back to the original max-size zero chunk.
+    let mut client = enroll::connect_authenticated(&fx.daemon.url, &fx.state)
+        .await
+        .unwrap();
+    let mut stream = client
+        .get_chunks(GetChunksRequest {
+            chunk_ids: vec![max_chunk.as_bytes().to_vec()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let downloaded = stream.message().await.unwrap().expect("one blob streamed");
+    assert!(stream.message().await.unwrap().is_none());
+    assert_eq!(downloaded.chunk_id, max_chunk.as_bytes().to_vec());
+    assert_eq!(
+        downloaded.data.len(),
+        fx.chunker.max_size() + BLOB_OVERHEAD,
+        "the downloaded ciphertext blob itself must exceed 4 MiB"
+    );
+    let restored = crypto::decrypt_chunk(&key, &max_chunk, &downloaded.data).unwrap();
+    assert_eq!(restored, vec![0u8; fx.chunker.max_size()]);
 
     fx.daemon.stop().await;
 }

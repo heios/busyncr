@@ -45,7 +45,12 @@ async fn spawn_daemon(
         .connect()
         .await
         .unwrap();
-    (BusyncrClient::new(channel), shutdown_tx, server)
+    // Same message-size limits production clients apply (a max-size chunk
+    // blob exceeds tonic's 4 MiB default).
+    let client = BusyncrClient::new(channel)
+        .max_decoding_message_size(busyncr_proto::MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(busyncr_proto::MAX_MESSAGE_SIZE);
+    (client, shutdown_tx, server)
 }
 
 /// Deterministic test chunks: contents differ, IDs are honest BLAKE3.
