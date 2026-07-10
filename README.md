@@ -161,6 +161,75 @@ busyncr-client restore --config busyncr-client.toml --state C:\ProgramData\busyn
 The old machine's entire history is now visible and restorable from the new
 one (FR6), and the new machine can keep backing up into the same set.
 
+### Manual vs scheduled operation
+
+Both sides of BusyNCR draw a hard line between something happening because
+*you* ran a command and something happening on a timer, and every automatic
+behavior has a manual equivalent that always works regardless of config
+(FR-M1):
+
+- **Client**: `backup` is always a single, one-shot, manual run. Scheduled
+  behavior is opt-in only, via `run --interval` (step 4 above) or by
+  installing the Windows service — nothing backs up on a timer unless you
+  asked it to.
+- **Daemon**: pruning is controlled by `auto_prune` in `<store>/daemon.toml`
+  (created with `auto_prune = true` the first time `serve` runs against a
+  fresh store):
+  ```toml
+  # <store>/daemon.toml
+  auto_prune = true
+  ```
+  With `auto_prune = true` (the default), `serve` applies the retention grid
+  (see below) right after every completed backup, plus once a day as a
+  safety-net timer in case no backup lands for a while. Set it to `false` to
+  turn both off — snapshots then accumulate until you run `busyncr-daemon
+  prune` yourself. `prune` is always available as a manual command either
+  way, and every prune — automatic or manual — is recorded with which mode
+  produced it (visible via `busyncr-daemon status`, below).
+
+Live progress on `backup`/`restore` streams to **stderr** (stdout is
+reserved for the final summary), so it composes cleanly with logging and
+piping:
+
+```sh
+busyncr-client backup --config busyncr-client.toml --state C:\ProgramData\busyncr
+busyncr-client backup --config busyncr-client.toml --state C:\ProgramData\busyncr --quiet
+busyncr-client backup --config busyncr-client.toml --state C:\ProgramData\busyncr --json-progress
+```
+
+Plain runs print a self-updating line (files, chunks to-ship/shipped, bytes
+shipped, throughput, coarse ETA) when stderr is a TTY, or one line per update
+when it's redirected to a file/log — never garbled `\r` spam either way.
+`--quiet` suppresses progress entirely (only the final stdout summary
+remains); `--json-progress` instead emits one NDJSON object per update on
+stderr for machine consumption, sourced from the exact same byte-accounting
+ledger FR3 uses to report the final totals — nothing is estimated twice.
+`restore` supports the same two flags.
+
+Check on either side at any time with `status`:
+
+```sh
+busyncr-client status --config busyncr-client.toml --state C:\ProgramData\busyncr
+busyncr-daemon status --store /var/lib/busyncr
+```
+
+`busyncr-client status` reports enrollment identity, the committed chunk
+size, the persisted record of the last backup this client ran (files, bytes,
+duration — survives restarts, written after every manual or scheduled
+backup), and the last few snapshots when the daemon is reachable.
+`busyncr-daemon status` reports total snapshots (and a per-client breakdown,
+when clients are identifiable), unique chunks, total store bytes, zero-ref
+(collectible) chunk count, and the time and mode (`auto`/`manual`) of the
+last prune and last GC. Both accept `--json` for scripting. `busyncr-daemon
+status` is safe to run while `serve` is running *in the same process* (e.g.
+tests exercising the store directly); as a genuinely separate OS process
+against a store a running `serve` already has open, it depends on the
+storage engine's file locking (redb takes an exclusive lock for the whole
+lifetime of an open store) and may report a clean "store is in use" error
+rather than a live reading — there is no cross-process live-status RPC in
+v1. Prefer running `status` against a store that isn't concurrently held
+open by `serve` for a guaranteed read.
+
 ### Retention and garbage collection (daemon side)
 
 ```sh

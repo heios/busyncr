@@ -198,6 +198,42 @@ pub async fn run_backup<R: CryptoRng>(
     req: &BackupRequest<'_>,
     rng: &mut R,
 ) -> Result<BackupReport, BackupError> {
+    run_backup_with_progress(req, rng, &mut |_, _, _| {}).await
+}
+
+/// Cheap, known-upfront totals for the FR-M1 M2.1 progress renderer's coarse
+/// ETA: how many files this run will walk, and an estimate of their total
+/// plaintext bytes (stat'd before chunking starts — a directory-metadata
+/// pass, not a second content read, so it does not cost the "one read pass"
+/// the module docs promise for the chunking itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupTotals {
+    /// Files [`collect_files`] found under the configured roots.
+    pub total_files: u64,
+    /// Sum of those files' on-disk sizes at stat time. A coarse estimate: a
+    /// file that changes between this stat and being chunked can make the
+    /// real total differ slightly, which is fine for a progress ETA.
+    pub total_bytes: u64,
+}
+
+/// As [`run_backup`], additionally invoking `on_progress` at every point the
+/// running ledger changes (FR-M1 M2.1/M2.2): after each file finishes
+/// chunking, and after each dedup/upload batch flush. `on_progress` always
+/// receives the *same* [`BackupReport`] this call will ultimately return
+/// (just captured mid-run), so progress figures can never drift from the
+/// final FR3 byte-accounting — there is only one counter, not a shadow copy.
+/// The final call's third argument is `true`, marking it as reflecting
+/// every counter's final value for this run (FR-M1b) — every earlier call
+/// gets `false`.
+///
+/// # Errors
+///
+/// As [`run_backup`].
+pub async fn run_backup_with_progress<R: CryptoRng>(
+    req: &BackupRequest<'_>,
+    rng: &mut R,
+    on_progress: &mut (dyn FnMut(&BackupReport, BackupTotals, bool) + Send),
+) -> Result<BackupReport, BackupError> {
     let key = enroll::load_data_key(req.state_dir)?;
     let chunk_id_key = enroll::load_chunk_id_key(req.state_dir)?;
     let mut client = enroll::connect_authenticated(req.daemon_url, req.state_dir).await?;
@@ -215,6 +251,14 @@ pub async fn run_backup<R: CryptoRng>(
     };
 
     let specs = collect_files(req.roots)?;
+    let totals = BackupTotals {
+        total_files: specs.len() as u64,
+        total_bytes: specs
+            .iter()
+            .filter_map(|s| fs::metadata(&s.abs).ok())
+            .map(|m| m.len())
+            .sum(),
+    };
 
     let mut session = Session {
         client,
@@ -269,6 +313,7 @@ pub async fn run_backup<R: CryptoRng>(
                 if pending.len() >= BATCH_MAX_CHUNKS || pending_bytes >= BATCH_MAX_BYTES {
                     session.flush(&mut pending, rng).await?;
                     pending_bytes = 0;
+                    on_progress(&session.report, totals, false);
                 }
             }
         }
@@ -286,8 +331,10 @@ pub async fn run_backup<R: CryptoRng>(
             mode: file_mode(&metadata),
             chunks: chunk_ids,
         });
+        on_progress(&session.report, totals, false);
     }
     session.flush(&mut pending, rng).await?;
+    on_progress(&session.report, totals, true);
     session.report.compression = session.counters;
 
     let manifest = Manifest {

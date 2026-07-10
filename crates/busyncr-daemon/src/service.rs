@@ -40,8 +40,10 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use busyncr_core::chunking::ChunkId;
+use busyncr_core::retention::RetentionPolicy;
 use busyncr_proto::v1::busyncr_server::{Busyncr, BusyncrServer};
 use busyncr_proto::v1::{
     ChunkBlob, EnrollRequest, EnrollResponse, GetChunksRequest, GetManifestRequest,
@@ -56,7 +58,7 @@ use tonic::{Request, Response, Status, Streaming};
 use ulid::Ulid;
 
 use crate::identity::{ClientStatus, DaemonIdentity, IdentityError};
-use crate::store::{ChunkStore, StoreError};
+use crate::store::{ChunkStore, PruneMode, StoreError};
 
 /// Errors from running the gRPC server.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +76,12 @@ pub struct BusyncrService {
     /// path ([`serve`]), where enrollment is unavailable and no RPC checks
     /// client certificates.
     auth: Option<Arc<DaemonIdentity>>,
+    /// FR-M1 M1.2: apply the retention grid after every completed backup
+    /// (`PutManifest`). `false` (the default via [`Self::new`] /
+    /// [`Self::with_auth`]) preserves every existing test's assumption that
+    /// nothing prunes on its own — only [`serve_tls_with_config`] turns this
+    /// on, driven by [`crate::config::DaemonConfig::auto_prune`].
+    auto_prune: bool,
 }
 
 impl BusyncrService {
@@ -84,7 +92,11 @@ impl BusyncrService {
     /// [`Self::with_auth`] / [`serve_tls`].
     #[must_use]
     pub fn new(store: Arc<ChunkStore>) -> Self {
-        Self { store, auth: None }
+        Self {
+            store,
+            auth: None,
+            auto_prune: false,
+        }
     }
 
     /// Wraps a chunk store plus the daemon identity: every RPC except
@@ -95,7 +107,19 @@ impl BusyncrService {
         Self {
             store,
             auth: Some(identity),
+            auto_prune: false,
         }
+    }
+
+    /// Turns on FR-M1 M1.2 post-backup auto-prune: a successful
+    /// `PutManifest` triggers a best-effort `PruneMode::Auto` prune before
+    /// the RPC returns. A prune failure here is logged, never propagated —
+    /// the backup that already committed must not be reported as failed
+    /// because housekeeping afterwards hit trouble.
+    #[must_use]
+    pub fn with_auto_prune(mut self, auto_prune: bool) -> Self {
+        self.auto_prune = auto_prune;
+        self
     }
 
     /// Enforces mTLS client authentication for one request (FR1).
@@ -201,6 +225,27 @@ pub async fn serve_tls(
     listener: TcpListener,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ServeError> {
+    serve_tls_with_config(store, identity, listener, shutdown, false).await
+}
+
+/// As [`serve_tls`], with FR-M1 M1.2's `auto_prune` explicitly controlled:
+/// `true` makes every completed backup (`PutManifest`) trigger a best-effort
+/// `PruneMode::Auto` prune before the RPC returns (the daily-timer half of
+/// M1.2 is [`run_prune_timer`], spawned separately by `busyncr-daemon
+/// serve`). This is what the production binary uses; [`serve_tls`] itself
+/// stays hard-wired to `false` so every existing caller (tests included)
+/// keeps its current "nothing prunes unless I ask it to" behavior.
+///
+/// # Errors
+///
+/// Returns [`ServeError::Transport`] if TLS setup or the transport fails.
+pub async fn serve_tls_with_config(
+    store: Arc<ChunkStore>,
+    identity: Arc<DaemonIdentity>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()>,
+    auto_prune: bool,
+) -> Result<(), ServeError> {
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(
             identity.server_cert_pem(),
@@ -210,10 +255,56 @@ pub async fn serve_tls(
         .client_auth_optional(true);
     tonic::transport::Server::builder()
         .tls_config(tls)?
-        .add_service(BusyncrService::with_auth(store, identity).into_server())
+        .add_service(
+            BusyncrService::with_auth(store, identity)
+                .with_auto_prune(auto_prune)
+                .into_server(),
+        )
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await?;
     Ok(())
+}
+
+/// Whole milliseconds since the Unix epoch, or 0 if the clock predates it
+/// (defensive; never observed off this machine).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// FR-M1 M1.2's daily half of `auto_prune`: applies the retention grid,
+/// tagged [`PruneMode::Auto`], every `interval` until `shutdown` resolves.
+/// A prune failure is logged to stderr and never stops the timer — a
+/// transient storage hiccup should not permanently disable auto-prune for
+/// the rest of the daemon's uptime.
+pub async fn run_prune_timer(
+    store: Arc<ChunkStore>,
+    interval: Duration,
+    mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+) {
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            () = tokio::time::sleep(interval) => {
+                let run_store = Arc::clone(&store);
+                let result = tokio::task::spawn_blocking(move || {
+                    run_store.prune(now_ms(), &RetentionPolicy::default_grid(), PruneMode::Auto)
+                })
+                .await;
+                match result {
+                    Ok(Ok(outcome)) => eprintln!(
+                        "auto-prune (daily timer): kept {} snapshot(s), dropped {}",
+                        outcome.kept.len(),
+                        outcome.dropped.len()
+                    ),
+                    Ok(Err(e)) => eprintln!("auto-prune (daily timer) failed: {e}"),
+                    Err(e) => eprintln!("auto-prune (daily timer) task failed: {e}"),
+                }
+            }
+        }
+    }
 }
 
 /// Binds `addr` and returns the listener plus its actual local address
@@ -404,7 +495,25 @@ impl Busyncr for BusyncrService {
         &self,
         request: Request<PutManifestRequest>,
     ) -> Result<Response<PutManifestResponse>, Status> {
-        self.authenticate(peer_fingerprint(&request)).await?;
+        let fingerprint = peer_fingerprint(&request);
+        self.authenticate(fingerprint.clone()).await?;
+        // FR-M1 M3.2: attribute the snapshot to the enrolled client that
+        // shipped it, so `busyncr-daemon status` can break counts down per
+        // client. Best-effort: a lookup failure (or the unauthenticated
+        // in-process test path, where there is no registry at all) simply
+        // leaves the snapshot unattributed rather than failing the backup.
+        let owner = match (&self.auth, fingerprint) {
+            (Some(identity), Some(fp)) => {
+                let identity = Arc::clone(identity);
+                tokio::task::spawn_blocking(move || identity.client_name(&fp))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+            }
+            _ => None,
+        };
+
         let PutManifestRequest {
             manifest,
             snapshot_id,
@@ -418,8 +527,27 @@ impl Busyncr for BusyncrService {
             .iter()
             .map(|b| parse_chunk_id(b))
             .collect::<Result<Vec<_>, _>>()?;
-        self.blocking(move |store| store.put_snapshot(snapshot, &manifest, &refs))
-            .await?;
+        self.blocking(move |store| {
+            store.put_snapshot_as(snapshot, &manifest, &refs, owner.as_deref())
+        })
+        .await?;
+
+        // FR-M1 M1.2: post-backup auto-prune. Runs after the snapshot is
+        // durably committed, and its outcome never turns a successful
+        // backup into a failed RPC.
+        if self.auto_prune {
+            let prune_store = Arc::clone(&self.store);
+            let result = tokio::task::spawn_blocking(move || {
+                prune_store.prune(now_ms(), &RetentionPolicy::default_grid(), PruneMode::Auto)
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("auto-prune (post-backup) failed: {e}"),
+                Err(e) => eprintln!("auto-prune (post-backup) task failed: {e}"),
+            }
+        }
+
         Ok(Response::new(PutManifestResponse {}))
     }
 

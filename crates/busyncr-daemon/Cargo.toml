@@ -28,6 +28,11 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 blake3 = "1.8.5"
 rand = "0.10.2"
 serde = { version = "1", features = ["derive"] }
+# serde_json is not named in the AGENTS.md ask-free palette, but FR-M1 M3.3
+# mandates `--json` on `busyncr-daemon status` (same justification as
+# busyncr-client's existing `--json` support: serde_json is the serde-family
+# JSON serializer, and serde itself is in the palette).
+serde_json = "1"
 toml = "0.9"
 # tokio-stream is not named in the palette; it is the tokio project's own
 # companion crate (same org/release train as the palette's `tokio`) and is

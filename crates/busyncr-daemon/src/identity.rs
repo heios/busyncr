@@ -368,6 +368,29 @@ impl DaemonIdentity {
         })
     }
 
+    /// Enrollment name registered under a certificate fingerprint, if any
+    /// (FR-M1 M3.2: attributing a stored snapshot to the client that shipped
+    /// it, for `busyncr-daemon status`'s "per enrolled client" breakdown).
+    /// Returns the name regardless of revocation status — a revoked
+    /// client's *past* snapshots still belong to it.
+    ///
+    /// # Errors
+    ///
+    /// [`IdentityError::Io`] / [`IdentityError::RegistryParse`] on registry
+    /// trouble; an unknown fingerprint is `Ok(None)`, not an error.
+    pub fn client_name(&self, fingerprint: &str) -> Result<Option<String>, IdentityError> {
+        let path = self.client_path(fingerprint);
+        match fs::read_to_string(&path) {
+            Ok(body) => {
+                let record: ClientRecord = toml::from_str(&body)
+                    .map_err(|source| IdentityError::RegistryParse { path, source })?;
+                Ok(Some(record.name))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(IdentityError::Io { path, source }),
+        }
+    }
+
     /// Marks every active certificate enrolled under `name` as revoked.
     /// Returns how many certificates were revoked (0 = no such client).
     ///

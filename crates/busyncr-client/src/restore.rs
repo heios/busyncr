@@ -172,6 +172,35 @@ pub struct RestoreReport {
 ///
 /// Any [`RestoreError`].
 pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, RestoreError> {
+    run_restore_with_progress(req, &mut |_, _, _| {}).await
+}
+
+/// Known-upfront totals for the FR-M1 M2.1 progress renderer's coarse ETA:
+/// the manifest declares every file's exact size before a single chunk is
+/// fetched, so unlike backup's estimate this total is exact, not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreTotals {
+    /// Files listed in the manifest.
+    pub total_files: u64,
+    /// Sum of the manifest's declared file sizes.
+    pub total_bytes: u64,
+}
+
+/// As [`run_restore`], additionally invoking `on_progress` at every point
+/// the running ledger changes (FR-M1 M2.1/M2.2): after each chunk is
+/// fetched, verified, and written, and after each file completes.
+/// `on_progress` always receives the same [`RestoreReport`] this call will
+/// ultimately return (captured mid-run), so progress can never drift from
+/// the final tally. The final call's third argument is `true` (FR-M1b);
+/// every earlier call gets `false`.
+///
+/// # Errors
+///
+/// As [`run_restore`].
+pub async fn run_restore_with_progress(
+    req: &RestoreRequest<'_>,
+    on_progress: &mut (dyn FnMut(&RestoreReport, RestoreTotals, bool) + Send),
+) -> Result<RestoreReport, RestoreError> {
     ensure_empty_target(req.target_dir)?;
 
     let key = enroll::load_data_key(req.state_dir)?;
@@ -188,6 +217,11 @@ pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, Rest
     let manifest_plaintext = crypto::decrypt_manifest(&key, req.snapshot_id, &manifest_blob)?;
     let manifest = Manifest::decode(&manifest_plaintext)?;
 
+    let totals = RestoreTotals {
+        total_files: manifest.files.len() as u64,
+        total_bytes: manifest.files.iter().map(|f| f.size).sum(),
+    };
+
     let mut report = RestoreReport {
         snapshot_id: req.snapshot_id,
         files: 0,
@@ -203,6 +237,8 @@ pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, Rest
             req.target_dir,
             file,
             &mut report,
+            totals,
+            on_progress,
         )
         .await?;
         if written != file.size {
@@ -213,15 +249,23 @@ pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, Rest
             });
         }
         report.files += 1;
-        report.bytes += written;
+        on_progress(&report, totals, false);
     }
+    // Guaranteed final call so the last progress observation always exactly
+    // matches the returned report (FR-M1b), independent of any throttling
+    // a renderer applies to the per-chunk/per-file calls above.
+    on_progress(&report, totals, true);
 
     Ok(report)
 }
 
 /// Reassembles one file: fetches its ordered chunk list, verifies and
 /// decrypts each blob, writes the plaintext, and restores mtime/permissions.
-/// Returns the number of plaintext bytes written.
+/// Returns the number of plaintext bytes written. Adds each chunk's
+/// plaintext length to `report.bytes` as it is written (not after the whole
+/// file, so progress can observe it mid-file) — the caller must not also
+/// add the return value to `report.bytes`.
+#[allow(clippy::too_many_arguments)]
 async fn restore_file(
     client: &mut BusyncrClient<Channel>,
     key: &busyncr_core::crypto::DataKey,
@@ -229,6 +273,8 @@ async fn restore_file(
     target_dir: &Path,
     file: &FileEntry,
     report: &mut RestoreReport,
+    totals: RestoreTotals,
+    on_progress: &mut (dyn FnMut(&RestoreReport, RestoreTotals, bool) + Send),
 ) -> Result<u64, RestoreError> {
     let rel = sanitize_path(&file.path)?;
     let out_path = target_dir.join(&rel);
@@ -286,8 +332,11 @@ async fn restore_file(
                     path: out_path.clone(),
                     source,
                 })?;
-            written += plaintext.len() as u64;
+            let chunk_len = plaintext.len() as u64;
+            written += chunk_len;
+            report.bytes += chunk_len;
             report.chunks_fetched += 1;
+            on_progress(&*report, totals, false);
         }
         if stream.message().await?.is_some() {
             return Err(RestoreError::BadResponse(

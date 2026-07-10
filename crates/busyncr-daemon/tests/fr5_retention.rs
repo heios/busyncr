@@ -21,7 +21,7 @@ use std::time::Duration;
 use busyncr_core::chunking::ChunkId;
 use busyncr_core::manifest::{FileEntry, Manifest};
 use busyncr_core::retention::{self, RetentionPolicy};
-use busyncr_daemon::store::ChunkStore;
+use busyncr_daemon::store::{ChunkStore, PruneMode};
 use ulid::Ulid;
 
 const STEP_MS: i64 = 3 * 60 * 60 * 1000; // 3 hours
@@ -153,7 +153,7 @@ fn fr5_sixty_day_grid_prunes_to_plan_survivors_restore_and_gc_shrinks_disk() {
     );
 
     // Prune applies exactly that plan.
-    let outcome = store.prune(now, &policy).unwrap();
+    let outcome = store.prune(now, &policy, PruneMode::Manual).unwrap();
     assert_eq!(
         outcome.kept.iter().copied().collect::<HashSet<_>>(),
         expected_keep,

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use busyncr_client::run::{run_scheduler, RunRequest, SystemClock};
 use busyncr_client::service::ServiceAction;
-use busyncr_client::{backup, config, enroll, keys, restore, service, snapshots};
+use busyncr_client::{backup, config, enroll, keys, restore, service, snapshots, status};
 use busyncr_core::scheduler::SchedulePolicy;
 use clap::{Parser, Subcommand};
 
@@ -73,6 +73,14 @@ enum Command {
         /// measured by bench-chunking (PRD §3.7).
         #[arg(long)]
         default_chunking: bool,
+        /// Suppress live progress on stderr (FR-M1 M2.1); errors still
+        /// print. Takes priority over --json-progress if both are given.
+        #[arg(long)]
+        quiet: bool,
+        /// Emit progress as NDJSON on stderr instead of a human-readable
+        /// line, for scripting (FR-M1 M2.1).
+        #[arg(long)]
+        json_progress: bool,
     },
 
     /// Run backups on a recurring jittered schedule until interrupted (FR8).
@@ -136,6 +144,14 @@ enum Command {
         snapshot: String,
         /// Target directory: created if missing, must be empty.
         target: PathBuf,
+        /// Suppress live progress on stderr (FR-M1 M2.1); errors still
+        /// print. Takes priority over --json-progress if both are given.
+        #[arg(long)]
+        quiet: bool,
+        /// Emit progress as NDJSON on stderr instead of a human-readable
+        /// line, for scripting (FR-M1 M2.1).
+        #[arg(long)]
+        json_progress: bool,
     },
 
     /// List the snapshots retained on the daemon, oldest first (FR6).
@@ -198,6 +214,30 @@ enum Command {
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
     },
+
+    /// Show this machine's enrollment identity, committed chunk size, the
+    /// last completed backup, and (when the daemon is reachable) its most
+    /// recent snapshot history (FR-M1 M3.1).
+    ///
+    /// Works with just `--state` (identity + last-backup record only);
+    /// `--config` additionally resolves the daemon URL and committed chunk
+    /// size, and lets `status` reach the daemon for recent snapshot history.
+    Status {
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+        /// Path to the client TOML config (daemon URL, chunk_target_size).
+        /// Optional: without it, status is limited to local state.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// How many of the most recent daemon-side snapshots to show
+        /// (requires --config and a reachable daemon).
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -215,7 +255,9 @@ fn main() -> std::process::ExitCode {
             config,
             state,
             default_chunking,
-        } => run_backup(&config, &state, default_chunking),
+            quiet,
+            json_progress,
+        } => run_backup(&config, &state, default_chunking, quiet, json_progress),
         Command::Run {
             config,
             state,
@@ -229,7 +271,9 @@ fn main() -> std::process::ExitCode {
             state,
             snapshot,
             target,
-        } => run_restore(&config, &state, &snapshot, &target),
+            quiet,
+            json_progress,
+        } => run_restore(&config, &state, &snapshot, &target, quiet, json_progress),
         Command::List { config, state } => run_list(&config, &state),
         Command::ExportKey {
             state,
@@ -243,6 +287,12 @@ fn main() -> std::process::ExitCode {
             passphrase,
             passphrase_file,
         } => run_import_key(&state, &keyfile, passphrase, passphrase_file.as_deref()),
+        Command::Status {
+            state,
+            config,
+            limit,
+            json,
+        } => run_status(&state, config.as_deref(), limit, json),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -303,11 +353,14 @@ fn run_enroll(
 
 /// `backup` subcommand: FR2/FR3 end to end from the client side. Injects the
 /// wall clock and OS entropy here at the binary edge; the library pipeline
-/// itself is deterministic.
+/// itself is deterministic. Live progress (FR-M1 M2.1) and the persisted
+/// last-backup record (FR-M1 M3.1) are both driven from this same edge.
 fn run_backup(
     config_path: &std::path::Path,
     state: &std::path::Path,
     default_chunking: bool,
+    quiet: bool,
+    json_progress: bool,
 ) -> anyhow::Result<()> {
     let config = config::ClientConfig::load(config_path)?;
     let chunker = config.chunker(default_chunking)?;
@@ -327,12 +380,24 @@ fn run_backup(
         created_at,
     };
 
+    let start = std::time::Instant::now();
+    let mut progress = busyncr_client::progress::ProgressReporter::new(quiet, json_progress);
     let report = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting tokio runtime")?
-        .block_on(backup::run_backup(&request, &mut rand::rng()))
-        .context("backup failed")?;
+        .block_on(backup::run_backup_with_progress(
+            &request,
+            &mut rand::rng(),
+            &mut |report, totals, final_tick| progress.backup_tick(report, totals, final_tick),
+        ));
+    progress.finish();
+    let report = report.context("backup failed")?;
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    status::LastBackupRecord::from_report(&report, created_at, duration_ms)
+        .save(state)
+        .context("persisting last-backup record")?;
 
     println!(
         "snapshot {} stored on {}",
@@ -400,27 +465,44 @@ fn run_scheduled(
                 &SystemClock,
                 &mut rand::rng(),
                 Box::pin(shutdown_signal()),
-                report_tick,
+                |tick| report_tick(tick, state),
             )
             .await;
         });
     Ok(())
 }
 
-/// Prints the outcome of one scheduled backup attempt. A failed attempt is
-/// logged, not fatal — the schedule keeps running (FR8).
-fn report_tick(tick: busyncr_client::run::Tick) {
+/// Prints the outcome of one scheduled backup attempt and, on success,
+/// persists it as the state dir's last-backup record (FR-M1 M3.1) — every
+/// scheduled tick counts, not just one-shot `backup`. A failed attempt is
+/// logged, not fatal — the schedule keeps running (FR8). Duration is
+/// measured here (the binary edge), against the real wall clock, from the
+/// tick's own `started_at_ms`.
+fn report_tick(tick: busyncr_client::run::Tick, state: &std::path::Path) {
     match tick.result {
-        Ok(report) => println!(
-            "[t={}ms] snapshot {} stored: {} file(s), {} chunk(s) shipped \
-             ({} bytes), {} deduplicated",
-            tick.started_at_ms,
-            report.snapshot_id,
-            report.files,
-            report.chunks_uploaded,
-            report.upload_bytes,
-            report.chunks_deduped
-        ),
+        Ok(report) => {
+            println!(
+                "[t={}ms] snapshot {} stored: {} file(s), {} chunk(s) shipped \
+                 ({} bytes), {} deduplicated",
+                tick.started_at_ms,
+                report.snapshot_id,
+                report.files,
+                report.chunks_uploaded,
+                report.upload_bytes,
+                report.chunks_deduped
+            );
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(tick.started_at_ms);
+            let duration_ms = u64::try_from((now_ms - tick.started_at_ms).max(0)).unwrap_or(0);
+            let created_at = tick.started_at_ms.div_euclid(1000);
+            if let Err(err) =
+                status::LastBackupRecord::from_report(&report, created_at, duration_ms).save(state)
+            {
+                eprintln!("warning: could not persist last-backup record: {err:#}");
+            }
+        }
         Err(err) => eprintln!(
             "[t={}ms] backup attempt failed: {err:#}",
             tick.started_at_ms
@@ -621,12 +703,15 @@ fn run_import_key(
     Ok(())
 }
 
-/// `restore` subcommand: FR4/FR9 end to end from the client side.
+/// `restore` subcommand: FR4/FR9 end to end from the client side. Live
+/// progress (FR-M1 M2.1) is driven from this same edge.
 fn run_restore(
     config_path: &std::path::Path,
     state: &std::path::Path,
     snapshot: &str,
     target: &std::path::Path,
+    quiet: bool,
+    json_progress: bool,
 ) -> anyhow::Result<()> {
     let config = config::ClientConfig::load(config_path)?;
     let snapshot_id: ulid::Ulid = snapshot
@@ -640,12 +725,17 @@ fn run_restore(
         target_dir: target,
     };
 
+    let mut progress = busyncr_client::progress::ProgressReporter::new(quiet, json_progress);
     let report = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting tokio runtime")?
-        .block_on(restore::run_restore(&request))
-        .context("restore failed")?;
+        .block_on(restore::run_restore_with_progress(
+            &request,
+            &mut |report, totals, final_tick| progress.restore_tick(report, totals, final_tick),
+        ));
+    progress.finish();
+    let report = report.context("restore failed")?;
 
     println!(
         "snapshot {} restored to {}",
@@ -656,5 +746,136 @@ fn run_restore(
         "  {} file(s), {} bytes written, {} chunk(s) fetched and verified",
         report.files, report.bytes, report.chunks_fetched
     );
+    Ok(())
+}
+
+/// Machine-readable `busyncr-client status --json` payload (FR-M1 M3.1/M3.3).
+#[derive(serde::Serialize)]
+struct ClientStatusJson {
+    state_dir: String,
+    enrolled: bool,
+    name: Option<String>,
+    cert_fingerprint: Option<String>,
+    daemon_url: Option<String>,
+    chunk_target_size: Option<String>,
+    last_backup: Option<status::LastBackupRecord>,
+    recent_snapshots: Vec<RecentSnapshotJson>,
+    daemon_reachable: bool,
+}
+
+/// One entry of `recent_snapshots` in [`ClientStatusJson`].
+#[derive(serde::Serialize)]
+struct RecentSnapshotJson {
+    id: String,
+    time_utc: String,
+}
+
+/// `status` subcommand: local enrollment identity + committed chunk size +
+/// the persisted last-backup record, plus (when `--config` is given and the
+/// daemon answers) its most recent snapshot history (FR-M1 M3.1).
+fn run_status(
+    state: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let name = enroll::load_enrollment_name(state).ok();
+    let cert_fingerprint = enroll::cert_fingerprint(state).ok();
+    let enrolled = name.is_some() && cert_fingerprint.is_some();
+
+    let config = match config_path {
+        Some(path) => Some(config::ClientConfig::load(path)?),
+        None => None,
+    };
+    let daemon_url = config.as_ref().map(|c| c.daemon.clone());
+    let chunk_target_size = config.as_ref().and_then(|c| c.chunk_target_size.clone());
+
+    let last_backup =
+        status::LastBackupRecord::load(state).context("reading last-backup record")?;
+
+    let mut recent_snapshots = Vec::new();
+    let mut daemon_reachable = false;
+    if let Some(config) = &config {
+        if enrolled {
+            let fetched = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("starting tokio runtime")?
+                .block_on(snapshots::list_snapshots(&config.daemon, state));
+            if let Ok(entries) = fetched {
+                daemon_reachable = true;
+                recent_snapshots = entries
+                    .iter()
+                    .rev()
+                    .take(limit)
+                    .map(|e| RecentSnapshotJson {
+                        id: e.id.to_string(),
+                        time_utc: snapshots::format_utc_ms(e.timestamp_ms),
+                    })
+                    .collect();
+                recent_snapshots.reverse();
+            }
+        }
+    }
+
+    if json {
+        let payload = ClientStatusJson {
+            state_dir: state.display().to_string(),
+            enrolled,
+            name,
+            cert_fingerprint,
+            daemon_url,
+            chunk_target_size,
+            last_backup,
+            recent_snapshots,
+            daemon_reachable,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("state:               {}", state.display());
+    match &name {
+        Some(name) => println!("enrolled as:         {name}"),
+        None => println!("enrolled as:         (not enrolled — run `busyncr-client enroll`)"),
+    }
+    if let Some(fp) = &cert_fingerprint {
+        println!("cert fingerprint:    {fp}");
+    }
+    match &daemon_url {
+        Some(url) => println!("daemon:              {url}"),
+        None => println!("daemon:              (unknown — pass --config)"),
+    }
+    match &chunk_target_size {
+        Some(size) => println!("chunk_target_size:   {size}"),
+        None => println!("chunk_target_size:   (not committed — run `bench-chunking`)"),
+    }
+    match &last_backup {
+        Some(record) => {
+            println!("last backup:");
+            println!("  snapshot:          {}", record.snapshot_id);
+            println!(
+                "  created:           {}",
+                snapshots::format_utc_ms(record.created_at.max(0) as u64 * 1000)
+            );
+            println!("  files:             {}", record.files);
+            println!("  upload bytes:      {}", record.upload_bytes);
+            println!("  duration:          {} ms", record.duration_ms);
+        }
+        None => println!("last backup:         never (this state dir has not completed a backup)"),
+    }
+    if config.is_some() {
+        if daemon_reachable {
+            println!("recent snapshots (daemon reachable, newest first):");
+            for entry in recent_snapshots.iter().rev() {
+                println!("  {}  {}", entry.id, entry.time_utc);
+            }
+            if recent_snapshots.is_empty() {
+                println!("  (none)");
+            }
+        } else {
+            println!("recent snapshots:    (daemon unreachable)");
+        }
+    }
     Ok(())
 }

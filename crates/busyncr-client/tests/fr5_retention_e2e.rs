@@ -25,7 +25,7 @@ use busyncr_client::restore::{run_restore, RestoreError, RestoreRequest};
 use busyncr_core::retention::RetentionPolicy;
 use busyncr_daemon::identity::DaemonIdentity;
 use busyncr_daemon::service;
-use busyncr_daemon::store::ChunkStore;
+use busyncr_daemon::store::{ChunkStore, PruneMode};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tonic::Code;
@@ -188,7 +188,7 @@ async fn fr5_prune_and_gc_over_real_backups_keep_plan_survivors_restorable() {
     // dropped; `a` and `old` survive.
     let outcome = hx
         .store
-        .prune(now, &RetentionPolicy::default_grid())
+        .prune(now, &RetentionPolicy::default_grid(), PruneMode::Manual)
         .unwrap();
     assert_eq!(
         outcome.dropped,

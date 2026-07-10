@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# blake3 is in the AGENTS.md ask-free palette; FR-M1 M3.1's `busyncr-client
+# status` fingerprints the enrolled certificate the same way the daemon does
+# (BLAKE3 of the DER) so an operator can cross-check the daemon's registry.
+blake3 = "1.8.5"
 busyncr-core.workspace = true
 busyncr-proto.workspace = true
 clap = { version = "4", features = ["derive"] }
@@ -61,6 +65,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-blake3 = "1.8.5"
 busyncr-daemon = { path = "../busyncr-daemon" }
 tempfile = "3"

@@ -71,6 +71,10 @@ pub const CA_CERT_FILE: &str = "ca-cert.pem";
 pub const DATA_KEY_FILE: &str = "data.key";
 /// File name of the raw keyed-chunk-ID key inside the state directory (FR-K1).
 pub const CHUNK_ID_KEY_FILE: &str = "chunk-id.key";
+/// File name of the persisted enrollment name inside the state directory
+/// (FR-M1 M3.1: `busyncr-client status` shows it without having to parse the
+/// certificate's Common Name back out of `client-cert.pem`).
+pub const ENROLLMENT_NAME_FILE: &str = "enrollment-name";
 
 /// Errors from enrollment and mTLS channel setup.
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +141,10 @@ pub struct EnrolledIdentity {
     pub key_pem: String,
     /// The daemon CA certificate (PEM) — the pin we verified against.
     pub ca_cert_pem: String,
+    /// This machine's enrollment name (certificate Common Name), persisted
+    /// separately so `busyncr-client status` (FR-M1 M3.1) can show it
+    /// without parsing X.509 subject fields back out of `client-cert.pem`.
+    pub name: String,
 }
 
 impl std::fmt::Debug for EnrolledIdentity {
@@ -194,6 +202,7 @@ pub async fn request_enrollment(req: &EnrollmentRequest) -> Result<EnrolledIdent
         // Keep trusting the CA we pinned for this enrollment, not whatever
         // the response carried.
         ca_cert_pem: req.ca_cert_pem.clone(),
+        name: req.name.clone(),
     })
 }
 
@@ -222,7 +231,87 @@ pub fn save_identity(state_dir: &Path, identity: &EnrolledIdentity) -> Result<()
         identity.ca_cert_pem.as_bytes(),
         false,
     )?;
+    write_atomic(
+        &state_dir.join(ENROLLMENT_NAME_FILE),
+        identity.name.as_bytes(),
+        false,
+    )?;
     Ok(())
+}
+
+/// Loads the enrollment name persisted by [`save_identity`] (FR-M1 M3.1).
+///
+/// # Errors
+///
+/// [`EnrollError::Io`] if the file is unreadable (including not-yet-enrolled).
+pub fn load_enrollment_name(state_dir: &Path) -> Result<String, EnrollError> {
+    let path = state_dir.join(ENROLLMENT_NAME_FILE);
+    fs::read_to_string(&path).map_err(|source| EnrollError::Io { path, source })
+}
+
+/// BLAKE3 hex fingerprint of the enrolled client certificate in `state_dir`
+/// — the same value the daemon computes over the certificate DER to key its
+/// client registry (FR-M1 M3.1: `busyncr-client status` shows it so an
+/// operator can cross-check `busyncr-daemon revoke`/registry state).
+///
+/// # Errors
+///
+/// [`EnrollError::Io`] if the certificate file is unreadable;
+/// [`EnrollError::BadResponse`] if it is not valid PEM.
+pub fn cert_fingerprint(state_dir: &Path) -> Result<String, EnrollError> {
+    let path = state_dir.join(CLIENT_CERT_FILE);
+    let pem = fs::read_to_string(&path).map_err(|source| EnrollError::Io { path, source })?;
+    let der = pem_to_der(&pem).ok_or(EnrollError::BadResponse(
+        "client certificate is not valid PEM",
+    ))?;
+    Ok(blake3::hash(&der).to_hex().to_string())
+}
+
+/// Extracts the DER payload of the first PEM block in `pem`. Hand-rolled
+/// (no PEM/X.509 crate in the AGENTS.md palette beyond `rcgen`, which does
+/// not expose a bare decoder) — mirrors `busyncr-daemon::identity`'s
+/// identical helper, which computes fingerprints the same way server-side.
+fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    base64_decode(body.trim())
+}
+
+/// Minimal standard-alphabet base64 decoder (std has none; a full crate for
+/// one PEM body would be overkill) — mirrors
+/// `busyncr-daemon::identity`'s identical helper.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rev = [255u8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() {
+        rev[c as usize] = u8::try_from(i).ok()?;
+    }
+    let raw: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let stripped = match raw.iter().rev().take_while(|&&b| b == b'=').count() {
+        pad @ (0..=2) => &raw[..raw.len() - pad],
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
+    for chunk in stripped.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut acc = 0u32;
+        for &c in chunk {
+            let v = rev[c as usize];
+            if v == 255 {
+                return None;
+            }
+            acc = (acc << 6) | u32::from(v);
+        }
+        acc <<= 6 * (4 - chunk.len());
+        let bytes = acc.to_be_bytes();
+        out.extend_from_slice(&bytes[1..chunk.len()]);
+    }
+    Some(out)
 }
 
 /// Ensures the backup set's two secrets — the data key and the keyed-chunk-ID

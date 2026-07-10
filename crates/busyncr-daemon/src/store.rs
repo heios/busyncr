@@ -44,7 +44,7 @@
 //! never silent. (End-to-end plaintext verification against the chunk ID
 //! happens on the client after decryption, where the plaintext exists.)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -72,6 +72,20 @@ const SNAPSHOT_REFS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("snaps
 /// backup"). Marks for chunks that regain a reference are dropped, resetting
 /// the timer.
 const GC_MARKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("gc_marks");
+/// Snapshot owner table: 16-byte ULID → the enrolled client name that
+/// shipped it (FR-M1 M3.2, `busyncr-daemon status` "per enrolled client"
+/// breakdown). Absent for snapshots stored through a path that does not
+/// carry client attribution (e.g. the unauthenticated in-process test
+/// service, or history from before this table existed) — those group under
+/// the empty-string key.
+const SNAPSHOT_OWNER: TableDefinition<&[u8], &str> = TableDefinition::new("snapshot_owner");
+/// Daemon status metadata: small fixed-key table holding the "last prune"
+/// and "last gc" records `busyncr-daemon status` reports (FR-M1 M3.2).
+const STATUS_META: TableDefinition<&str, &[u8]> = TableDefinition::new("status_meta");
+/// [`STATUS_META`] key for the most recent prune's (time, mode).
+const LAST_PRUNE_KEY: &str = "last_prune";
+/// [`STATUS_META`] key for the most recent gc's time.
+const LAST_GC_KEY: &str = "last_gc";
 
 /// Byte length of the BLAKE3-of-blob header prefixed to every object file.
 const OBJECT_HEADER_LEN: usize = 32;
@@ -229,6 +243,8 @@ impl ChunkStore {
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(SNAPSHOT_REFS)?;
             txn.open_table(GC_MARKS)?;
+            txn.open_table(SNAPSHOT_OWNER)?;
+            txn.open_table(STATUS_META)?;
         }
         txn.commit()?;
 
@@ -454,6 +470,27 @@ impl ChunkStore {
         blob: &[u8],
         refs: &[ChunkId],
     ) -> Result<(), StoreError> {
+        self.put_snapshot_as(snapshot, blob, refs, None)
+    }
+
+    /// As [`Self::put_snapshot`], additionally recording which enrolled
+    /// client shipped the snapshot (FR-M1 M3.2: the "per enrolled client"
+    /// breakdown in `busyncr-daemon status`). `owner` is the client's
+    /// enrollment name; `None` leaves the snapshot ungrouped (the empty-name
+    /// bucket in [`ChunkStore::status`]) — used by paths with no client
+    /// attribution available (e.g. the unauthenticated in-process test
+    /// service).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_snapshot`].
+    pub fn put_snapshot_as(
+        &self,
+        snapshot: Ulid,
+        blob: &[u8],
+        refs: &[ChunkId],
+        owner: Option<&str>,
+    ) -> Result<(), StoreError> {
         let key = snapshot.to_bytes();
 
         let txn = self.db.begin_write()?;
@@ -487,6 +524,10 @@ impl ChunkStore {
             let mut snapshot_refs = txn.open_table(SNAPSHOT_REFS)?;
             snapshot_refs.insert(key.as_slice(), ref_bytes.as_slice())?;
             snapshots.insert(key.as_slice(), blob)?;
+            if let Some(owner) = owner {
+                let mut owners = txn.open_table(SNAPSHOT_OWNER)?;
+                owners.insert(key.as_slice(), owner)?;
+            }
         }
         txn.commit()?;
         Ok(())
@@ -573,6 +614,8 @@ impl ChunkStore {
             if snapshots.remove(key.as_slice())?.is_none() {
                 return Err(StoreError::SnapshotNotFound(snapshot));
             }
+            let mut owners = txn.open_table(SNAPSHOT_OWNER)?;
+            owners.remove(key.as_slice())?;
             let mut snapshot_refs = txn.open_table(SNAPSHOT_REFS)?;
             let ref_bytes = snapshot_refs
                 .remove(key.as_slice())?
@@ -677,12 +720,22 @@ impl ChunkStore {
     /// [`busyncr_core::retention::plan`], so prune is deterministic given
     /// `now_ms`.
     ///
+    /// `mode` (FR-M1 M1.2) records, for [`ChunkStore::status`], whether this
+    /// run was the daemon's own automation (`auto_prune = true`: post-backup
+    /// or the daily timer) or an operator's manual `busyncr-daemon prune` —
+    /// it does not affect what gets pruned, only what gets logged.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if listing or deleting a snapshot fails. A
     /// snapshot that vanishes between planning and deletion (concurrent
     /// prune) is treated as already pruned, not an error.
-    pub fn prune(&self, now_ms: i64, policy: &RetentionPolicy) -> Result<PruneOutcome, StoreError> {
+    pub fn prune(
+        &self,
+        now_ms: i64,
+        policy: &RetentionPolicy,
+        mode: PruneMode,
+    ) -> Result<PruneOutcome, StoreError> {
         let snapshots = self.list_snapshots()?;
         let items: Vec<(i64, Ulid)> = snapshots.iter().map(|&u| (ulid_time_ms(u), u)).collect();
         let plan = retention::plan(now_ms, &items, policy);
@@ -695,10 +748,27 @@ impl ChunkStore {
                 Err(e) => return Err(e),
             }
         }
+        self.record_prune(now_ms, mode)?;
         Ok(PruneOutcome {
             kept: plan.keep,
             dropped: plan.drop,
+            mode,
         })
+    }
+
+    /// Records the "last prune" entry [`ChunkStore::status`] reports
+    /// (FR-M1 M3.2). Best-effort bookkeeping, separate from the snapshot
+    /// deletions themselves: a torn write here (crash between the deletes
+    /// above and this commit) only loses the status log's memory of the
+    /// event, never any retained/pruned data.
+    fn record_prune(&self, now_ms: i64, mode: PruneMode) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(STATUS_META)?;
+            meta.insert(LAST_PRUNE_KEY, encode_prune_event(now_ms, mode).as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Reclaims unreferenced chunks that have been zero-ref for longer than
@@ -790,6 +860,11 @@ impl ChunkStore {
             for id in &marks_to_insert {
                 marks.insert(id.as_bytes().as_slice(), now_bytes.as_slice())?;
             }
+            // Record "last gc ran at now_ms" for `busyncr-daemon status`
+            // (FR-M1 M3.2) in the same transaction — every gc run counts,
+            // even one that reclaims nothing this time.
+            let mut meta = txn.open_table(STATUS_META)?;
+            meta.insert(LAST_GC_KEY, now_ms.to_le_bytes().as_slice())?;
             to_delete
         };
         txn.commit()?;
@@ -813,6 +888,114 @@ impl ChunkStore {
             pending,
         })
     }
+
+    /// A read-only snapshot of daemon-wide health for `busyncr-daemon
+    /// status` (FR-M1 M3.1/M3.2): snapshot counts (overall and per enrolled
+    /// client), unique chunk count and stored-blob bytes, chunks awaiting
+    /// `gc`, and the most recent prune/gc events.
+    ///
+    /// Computed entirely from `begin_read` transactions: redb readers never
+    /// block writers or each other, so this is safe to call on a
+    /// [`ChunkStore`] handle a `serve_tls` task is concurrently using in the
+    /// same process (see the module docs' concurrency note — a *second OS
+    /// process* opening the same store file while another holds it for
+    /// writing is a separate, storage-engine-level constraint this method
+    /// does not attempt to route around).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Index`] if the index cannot be read.
+    pub fn status(&self) -> Result<DaemonStatus, StoreError> {
+        let txn = self.db.begin_read()?;
+
+        let mut snapshots_total = 0u64;
+        let mut snapshots_by_client: BTreeMap<String, u64> = BTreeMap::new();
+        {
+            let snapshots = txn.open_table(SNAPSHOTS)?;
+            let owners = txn.open_table(SNAPSHOT_OWNER)?;
+            for item in snapshots.iter()? {
+                let (key, _) = item?;
+                snapshots_total += 1;
+                let owner = owners
+                    .get(key.value())?
+                    .map(|guard| guard.value().to_owned())
+                    .unwrap_or_default();
+                *snapshots_by_client.entry(owner).or_insert(0) += 1;
+            }
+        }
+
+        let mut chunks_unique = 0u64;
+        let mut store_bytes = 0u64;
+        let mut zero_ref_chunks = 0u64;
+        {
+            let chunks = txn.open_table(CHUNKS)?;
+            for item in chunks.iter()? {
+                let (_, value) = item?;
+                let entry = decode_entry(value.value());
+                chunks_unique += 1;
+                store_bytes += entry.chunk_len;
+                if entry.refcount == 0 {
+                    zero_ref_chunks += 1;
+                }
+            }
+        }
+
+        let meta = txn.open_table(STATUS_META)?;
+        let last_prune = meta
+            .get(LAST_PRUNE_KEY)?
+            .and_then(|guard| decode_prune_event(guard.value()));
+        let last_gc = meta
+            .get(LAST_GC_KEY)?
+            .and_then(|guard| decode_gc_event(guard.value()));
+
+        Ok(DaemonStatus {
+            snapshots_total,
+            snapshots_by_client,
+            chunks_unique,
+            store_bytes,
+            zero_ref_chunks,
+            last_prune,
+            last_gc,
+        })
+    }
+}
+
+/// Which control path produced a completed prune (FR-M1 M1.2): the daily
+/// timer / post-backup automation (`auto_prune = true`), or an operator's
+/// manual `busyncr-daemon prune`. Recorded per prune so
+/// [`ChunkStore::status`] can show which mode produced the most recent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneMode {
+    /// Triggered by the daemon itself (post-backup or the daily timer).
+    Auto,
+    /// Triggered by an operator running `busyncr-daemon prune`.
+    Manual,
+}
+
+impl PruneMode {
+    const fn to_byte(self) -> u8 {
+        match self {
+            PruneMode::Auto => 0,
+            PruneMode::Manual => 1,
+        }
+    }
+
+    const fn from_byte(b: u8) -> Self {
+        if b == 0 {
+            PruneMode::Auto
+        } else {
+            PruneMode::Manual
+        }
+    }
+}
+
+impl std::fmt::Display for PruneMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PruneMode::Auto => "auto",
+            PruneMode::Manual => "manual",
+        })
+    }
 }
 
 /// Outcome of [`ChunkStore::prune`]: which snapshots survived the retention
@@ -823,6 +1006,8 @@ pub struct PruneOutcome {
     pub kept: Vec<Ulid>,
     /// Snapshots pruned (their manifests removed, refcounts decremented).
     pub dropped: Vec<Ulid>,
+    /// Which control path produced this prune (FR-M1 M1.2).
+    pub mode: PruneMode,
 }
 
 /// Outcome of [`ChunkStore::gc`]: chunks reclaimed this run and those still
@@ -836,6 +1021,48 @@ pub struct GcOutcome {
     /// Zero-ref chunks marked but still within the grace period (not yet
     /// reclaimed this run).
     pub pending: usize,
+}
+
+/// The most recent prune, as reported by [`ChunkStore::status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneEvent {
+    /// When it ran, milliseconds since the Unix epoch.
+    pub at_ms: i64,
+    /// Which control path produced it.
+    pub mode: PruneMode,
+}
+
+/// The most recent gc, as reported by [`ChunkStore::status`]. `gc` is never
+/// automatic (FR-M1 M1.2 only automates `prune`), so there is no mode to
+/// record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcEvent {
+    /// When it ran, milliseconds since the Unix epoch.
+    pub at_ms: i64,
+}
+
+/// A read-only snapshot of daemon-wide health (FR-M1 M3.2), returned by
+/// [`ChunkStore::status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonStatus {
+    /// Total snapshots currently retained.
+    pub snapshots_total: u64,
+    /// Snapshot counts keyed by the enrolled client name that shipped them.
+    /// The empty-string key groups snapshots with no recorded owner (stored
+    /// through a path without client attribution).
+    pub snapshots_by_client: BTreeMap<String, u64>,
+    /// Distinct chunk IDs indexed.
+    pub chunks_unique: u64,
+    /// Sum of stored chunk-blob lengths (the index's `chunk_len` ledger —
+    /// the ciphertext payload size; excludes the small on-disk integrity
+    /// header).
+    pub store_bytes: u64,
+    /// Chunks at refcount zero, awaiting `gc`'s grace period.
+    pub zero_ref_chunks: u64,
+    /// The most recent prune, if the store has ever had one.
+    pub last_prune: Option<PruneEvent>,
+    /// The most recent gc, if the store has ever had one.
+    pub last_gc: Option<GcEvent>,
 }
 
 /// Snapshot creation time in milliseconds since the Unix epoch, read from its
@@ -859,6 +1086,37 @@ fn decode_mark(raw: &[u8]) -> i64 {
         bytes.copy_from_slice(raw);
     }
     i64::from_le_bytes(bytes)
+}
+
+/// Encodes a [`STATUS_META`] "last prune" record: 8-byte LE `now_ms`
+/// followed by the 1-byte [`PruneMode`] tag.
+fn encode_prune_event(now_ms: i64, mode: PruneMode) -> [u8; 9] {
+    let mut buf = [0u8; 9];
+    buf[..8].copy_from_slice(&now_ms.to_le_bytes());
+    buf[8] = mode.to_byte();
+    buf
+}
+
+/// Decodes a [`STATUS_META`] "last prune" record; `None` on a malformed
+/// width (defensive against a tampered database — treated the same as "no
+/// prune has run yet" rather than a panic).
+fn decode_prune_event(raw: &[u8]) -> Option<PruneEvent> {
+    let bytes: [u8; 9] = raw.try_into().ok()?;
+    let mut ts = [0u8; 8];
+    ts.copy_from_slice(&bytes[..8]);
+    Some(PruneEvent {
+        at_ms: i64::from_le_bytes(ts),
+        mode: PruneMode::from_byte(bytes[8]),
+    })
+}
+
+/// Decodes a [`STATUS_META`] "last gc" record (8-byte LE `now_ms`); `None`
+/// on a malformed width.
+fn decode_gc_event(raw: &[u8]) -> Option<GcEvent> {
+    let bytes: [u8; 8] = raw.try_into().ok()?;
+    Some(GcEvent {
+        at_ms: i64::from_le_bytes(bytes),
+    })
 }
 
 /// Decodes an [`IndexEntry`] from a redb value slice; a malformed length

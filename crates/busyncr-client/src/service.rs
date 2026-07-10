@@ -515,15 +515,38 @@ fn run_service_body() -> Result<(), ServiceError> {
                 let _ = async_stop_rx.await;
             }),
             |tick| match &tick.result {
-                Ok(report) => eventlog::log_info(&format!(
-                    "snapshot {} stored: {} file(s), {} chunk(s) shipped \
-                     ({} bytes), {} deduplicated",
-                    report.snapshot_id,
-                    report.files,
-                    report.chunks_uploaded,
-                    report.upload_bytes,
-                    report.chunks_deduped
-                )),
+                Ok(report) => {
+                    eventlog::log_info(&format!(
+                        "snapshot {} stored: {} file(s), {} chunk(s) shipped \
+                         ({} bytes), {} deduplicated",
+                        report.snapshot_id,
+                        report.files,
+                        report.chunks_uploaded,
+                        report.upload_bytes,
+                        report.chunks_deduped
+                    ));
+                    // FR-M1 M3.1: every service iteration persists the
+                    // last-backup record too, not just one-shot `backup`
+                    // and non-Windows `run`.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(tick.started_at_ms);
+                    let duration_ms =
+                        u64::try_from((now_ms - tick.started_at_ms).max(0)).unwrap_or(0);
+                    let created_at = tick.started_at_ms.div_euclid(1000);
+                    if let Err(err) = crate::status::LastBackupRecord::from_report(
+                        report,
+                        created_at,
+                        duration_ms,
+                    )
+                    .save(&run_args.state)
+                    {
+                        eventlog::log_error(&format!(
+                            "could not persist last-backup record: {err}"
+                        ));
+                    }
+                }
                 Err(err) => eventlog::log_error(&format!("scheduled backup attempt failed: {err}")),
             },
         )
