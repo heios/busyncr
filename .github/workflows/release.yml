@@ -11,8 +11,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  create-release:
+    name: Create the release (draft)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the draft release if it does not exist
+        # Runs once before the build matrix so every leg has a release to
+        # upload straight into. Idempotent: a re-run reuses the existing
+        # release rather than erroring.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ github.ref_name }} already exists — reusing it."
+          else
+            gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --title "BusyNCR ${{ github.ref_name }}" \
+              --generate-notes --draft
+          fi
+
   build:
     name: Build ${{ matrix.label }}
+    needs: create-release
     runs-on: ${{ matrix.os }}
     # Best-effort legs (matrix.optional) may fail without blocking the release.
     continue-on-error: ${{ matrix.optional == true }}
@@ -156,28 +177,31 @@ jobs:
           mkdir -p pkg
           cp target/${{ matrix.target }}/release/busyncr-client target/${{ matrix.target }}/release/busyncr-daemon README.md PRD.md pkg/
           tar -C pkg -czf busyncr-${{ github.ref_name }}-${{ matrix.label }}.tar.gz .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: busyncr-${{ matrix.label }}
-          path: |
-            busyncr-*.zip
-            busyncr-*.tar.gz
-          if-no-files-found: error
-
-  release:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-      - name: Create release with binaries
+      - name: Upload the archive to the release
+        # Attach the single packaged archive straight to the release instead of
+        # round-tripping through upload/download-artifact — that path re-zips our
+        # archive inside the artifact wrapper (the confusing zip-in-zip you get
+        # when downloading a workflow artifact, and a needless second compression
+        # of already-compressed bytes). bash on every OS so the glob expands the
+        # same way; --clobber keeps re-runs idempotent.
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --title "BusyNCR ${{ github.ref_name }}" \
-            --generate-notes \
-            busyncr-*.zip busyncr-*.tar.gz
+          gh release upload "${{ github.ref_name }}" \
+            busyncr-${{ github.ref_name }}-${{ matrix.label }}.* \
+            --repo "${{ github.repository }}" --clobber
+
+  publish:
+    name: Publish the release (un-draft)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Flip the release from draft to published
+        # Runs only after every required leg has uploaded its asset, so the
+        # release never appears publicly with a partial set of archives.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" --draft=false
