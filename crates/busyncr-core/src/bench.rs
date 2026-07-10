@@ -40,21 +40,11 @@ use serde::Serialize;
 use crate::chunking::{chunk_reader, ChunkId, ChunkerConfig, ChunkingError};
 use crate::index::IndexEntry;
 
-/// Fixed manifest header bytes: snapshot ULID (16) + created-at seconds
-/// (i64, 8) + file count (u32, 4).
-///
-/// Slice S3's manifest serialization must keep this layout so bench
-/// projections stay exact.
-pub const MANIFEST_HEADER_BYTES: u64 = 16 + 8 + 4;
-
-/// Fixed per-file metadata bytes in a manifest entry: path length prefix
-/// (u32, 4) + file size (u64, 8) + mtime seconds (i64, 8) + mtime nanos
-/// (u32, 4) + unix mode / windows attrs (u32, 4) + chunk count (u32, 4).
-///
-/// The variable parts — path bytes and 32 bytes per chunk ID — are added per
-/// file by [`build_report`]. Slice S3's manifest serialization must keep this
-/// layout so bench projections stay exact.
-pub const MANIFEST_FILE_FIXED_BYTES: u64 = 4 + 8 + 8 + 4 + 4 + 4;
+// The manifest layout constants moved to `crate::manifest` in slice S3,
+// where the real serializer lives; re-exported here so bench callers and the
+// documented projection formula keep working unchanged. `Manifest::encode`
+// produces exactly these sizes (pinned by test), so projections stay exact.
+pub use crate::manifest::{MANIFEST_FILE_FIXED_BYTES, MANIFEST_HEADER_BYTES};
 
 /// PRD §3.5 retention grid tiers as `(tier_start_hours, cell_width_hours)`:
 /// age < 24 h → one per 3 h; 24 h – 4 d → one per 24 h; 4 d – 16 d → one per

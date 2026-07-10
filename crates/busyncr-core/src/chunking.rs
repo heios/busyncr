@@ -59,7 +59,9 @@ pub enum ChunkIdParseError {
 ///
 /// Computed client-side before encryption, so equal plaintext always maps to
 /// the same ID regardless of file, snapshot, or encryption nonce (PRD §3.3).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ChunkId([u8; 32]);
 
 impl ChunkId {

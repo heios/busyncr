@@ -11,7 +11,9 @@ serde = { version = "1", features = ["derive"] }
 # thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
 # error-handling rule mandates "thiserror enums in core/library crates".
 thiserror = "2.0.18"
+ulid = { version = "1.2", features = ["serde"] }
 
 [dev-dependencies]
+postcard = { version = "1", features = ["alloc"] }
 rand = "0.10.2"
 tempfile = "3"

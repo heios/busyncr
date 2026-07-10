@@ -8,5 +8,17 @@ license.workspace = true
 name = "busyncr-daemon"
 path = "src/main.rs"
 
+[lib]
+name = "busyncr_daemon"
+path = "src/lib.rs"
+
 [dependencies]
 busyncr-core.workspace = true
+redb = "4.1"
+# thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
+# error-handling rule mandates "thiserror enums in core/library crates".
+thiserror = "2.0.18"
+ulid = "1.2"
+
+[dev-dependencies]
+tempfile = "3"
