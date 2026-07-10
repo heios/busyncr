@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/busyncr-core",
+    "crates/busyncr-proto",
+    "crates/busyncr-client",
+    "crates/busyncr-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/alexander-khx/busyncr"
+
+[workspace.dependencies]
+busyncr-core = { path = "crates/busyncr-core" }
+busyncr-proto = { path = "crates/busyncr-proto" }
+
+[profile.release]
+lto = "thin"

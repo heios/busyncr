@@ -1,0 +1,12 @@
+[package]
+name = "busyncr-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "busyncr-client"
+path = "src/main.rs"
+
+[dependencies]
+busyncr-core.workspace = true
