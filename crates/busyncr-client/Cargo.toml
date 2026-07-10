@@ -39,6 +39,27 @@ toml = "0.9"
 tonic = { workspace = true, features = ["tls-aws-lc"] }
 ulid = "1.2"
 
+# S11 (FR8 Windows part, PRD §3.6): Windows service install/start/stop/run,
+# only ever compiled for windows targets — a Linux build never pulls these
+# crates into its dependency graph at all.
+[target.'cfg(windows)'.dependencies]
+# windows-service is in the AGENTS.md ask-free palette ("windows-service (cfg
+# windows)") for exactly this purpose.
+windows-service = "0.8"
+# windows-sys is not named in the palette, but windows-service itself depends
+# on it (same version pinned here, so this adds no new crate to the dependency
+# *tree*, only a direct Cargo.toml line). It is needed because windows-service
+# wraps SCM install/start/stop/dispatch but not the Win32 Event Log APIs the
+# PRD's "event-log logging" requirement calls for; RegisterEventSourceW /
+# ReportEventW / DeregisterEventSource (advapi32) are called directly in
+# `service::eventlog`. `std::os::windows::ffi::OsStrExt` (std) covers the
+# UTF-16 conversion, so no wide-string crate is needed either.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_EventLog",
+] }
+
 [dev-dependencies]
 blake3 = "1.8.5"
 busyncr-daemon = { path = "../busyncr-daemon" }

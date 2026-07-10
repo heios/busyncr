@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use busyncr_client::run::{run_scheduler, RunRequest, SystemClock};
-use busyncr_client::{backup, config, enroll, restore};
+use busyncr_client::service::ServiceAction;
+use busyncr_client::{backup, config, enroll, restore, service};
 use busyncr_core::scheduler::SchedulePolicy;
 use clap::{Parser, Subcommand};
 
@@ -106,6 +107,18 @@ enum Command {
         jitter: f64,
     },
 
+    /// Manage this client as a Windows service (FR8 Windows part; PRD §3.6).
+    ///
+    /// Wraps the same scheduled backup loop as `run` (S10), but installed,
+    /// started, and stopped through the Windows Service Control Manager
+    /// instead of run in the foreground. Every action other than `run`
+    /// fails cleanly with an "unsupported platform" error when this binary
+    /// is not built for Windows.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Restore a retained snapshot to an empty directory (FR4, FR9).
     ///
     /// Fetches the manifest and every chunk it references, decrypts and
@@ -149,6 +162,7 @@ fn main() -> std::process::ExitCode {
             interval,
             jitter,
         } => run_scheduled(&config, &state, default_chunking, &interval, jitter),
+        Command::Service { action } => run_service_command(action),
         Command::Restore {
             config,
             state,
@@ -351,6 +365,41 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     eprintln!("stopping scheduled backups");
+}
+
+/// `service` subcommand: Windows Service Control Manager integration (FR8
+/// Windows part; PRD §3.6). See `busyncr_client::service` module docs for
+/// the install/start/stop/run design.
+fn run_service_command(action: ServiceAction) -> anyhow::Result<()> {
+    match action {
+        ServiceAction::Install(run_args) => {
+            service::install(&run_args).context("installing the Windows service")?;
+            println!(
+                "service {:?} installed (auto-start); `service start` to run it now",
+                service::SERVICE_NAME
+            );
+        }
+        ServiceAction::Uninstall => {
+            service::uninstall().context("uninstalling the Windows service")?;
+            println!("service {:?} uninstalled", service::SERVICE_NAME);
+        }
+        ServiceAction::Start => {
+            service::start().context("starting the Windows service")?;
+            println!("service {:?} start requested", service::SERVICE_NAME);
+        }
+        ServiceAction::Stop => {
+            service::stop().context("stopping the Windows service")?;
+            println!("service {:?} stop requested", service::SERVICE_NAME);
+        }
+        ServiceAction::Restart => {
+            service::restart().context("restarting the Windows service")?;
+            println!("service {:?} restart requested", service::SERVICE_NAME);
+        }
+        ServiceAction::Run(run_args) => {
+            service::run(run_args).context("running as a Windows service")?;
+        }
+    }
+    Ok(())
 }
 
 /// Parses a duration like `3h`, `90m`, `5400s`, or plain seconds.

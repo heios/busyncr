@@ -49,4 +49,65 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: test
         run: cargo test --workspace
-      # S11 adds: Windows service install/start/stop smoke test (PowerShell)
+      - name: Windows service install/start/stop smoke test (S11, FR8)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Resolve-Path "target\debug\busyncr-client.exe"
+
+          # A config good enough to reach the service's Running state: a
+          # real folder to "back up" and a committed chunk size, but a
+          # deliberately unreachable daemon — this smoke test only proves
+          # the SCM install/start/stop lifecycle and event-log wiring work,
+          # not that a scheduled backup attempt against a real daemon
+          # succeeds (that is FR2/FR3/FR8's job, covered elsewhere).
+          $work = Join-Path $env:RUNNER_TEMP "busyncr-svc-smoke"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $dataDir = Join-Path $work "data"
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          Set-Content -Path (Join-Path $dataDir "hello.txt") -Value "smoke test"
+          $stateDir = Join-Path $work "state"
+          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+          $configPath = Join-Path $work "client.toml"
+          $dataDirForward = $dataDir -replace '\\', '/'
+          @"
+          daemon = "https://127.0.0.1:1"
+          folders = ["$dataDirForward"]
+          chunk_target_size = "64K"
+          "@ | Set-Content -Path $configPath
+
+          function Invoke-Client {
+            param([string[]]$ClientArgs)
+            & $exe @ClientArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "busyncr-client $($ClientArgs -join ' ') failed with exit code $LASTEXITCODE"
+            }
+          }
+
+          # Best-effort cleanup from a previous (failed) run of this job.
+          & $exe service uninstall 2>$null
+          Start-Sleep -Seconds 1
+
+          Invoke-Client @("service", "install", "--config", $configPath, "--state", $stateDir)
+          Invoke-Client @("service", "start")
+
+          $svc = Get-Service -Name BusyNCRClient
+          $svc.WaitForStatus("Running", "00:00:30")
+          if ($svc.Status -ne "Running") {
+            throw "service did not reach Running (status: $($svc.Status))"
+          }
+          Write-Host "service reached Running"
+
+          Invoke-Client @("service", "stop")
+          $svc.WaitForStatus("Stopped", "00:00:30")
+          if ($svc.Status -ne "Stopped") {
+            throw "service did not reach Stopped (status: $($svc.Status))"
+          }
+          Write-Host "service reached Stopped"
+
+          Invoke-Client @("service", "uninstall")
+          if (Get-Service -Name BusyNCRClient -ErrorAction SilentlyContinue) {
+            throw "service BusyNCRClient still registered after uninstall"
+          }
+
+          Write-Host "Windows service install/start/stop smoke test passed"
