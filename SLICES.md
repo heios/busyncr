@@ -39,7 +39,7 @@ FR references point at PRD.md §4.
   overlap correct on corpus with known mutation rate. Human table + `--json`
   output; recommendation heuristic documented in `--help`. Deps: S1.
 
-- [ ] **S3 — Manifest + content-addressed chunk store.** In core: `Manifest`
+- [x] **S3 — Manifest + content-addressed chunk store.** In core: `Manifest`
   (serde + bincode or postcard): snapshot id (ULID), created_at, files
   (relative path, size, mtime, unix mode/windows attrs, ordered chunk IDs).
   In daemon: `ChunkStore`: CAS layout `objects/<first2hex>/<hex>`, atomic
@@ -143,3 +143,4 @@ cargo test --workspace
 | S0    | done   | (bootstrap) | skeleton green |
 | S1    | done   | 4e2fd84 | chunking module in core; fastcdc 4.0.1 caps sizes (min<=1MiB, target<=4MiB, max<=16MiB) — 4M-target bench candidate is the largest valid config |
 | S2    | done   | 8853148 | bench engine in core::bench + core::index (IndexEntry::WIRE_SIZE=48, S3 must reuse); deviations: default N = grid occupancy over a documented 1-year horizon (=36) since the >=16d tier is unbounded; manifest layout constants (header 28 B, per-file fixed 32 B) defined in core::bench — S3 must serialize to match; serde_json added to client (justified in Cargo.toml) for the PRD-mandated --json |
+| S3    | done   | be4f840 | core::manifest (Manifest/FileEntry) + daemon lib with store::ChunkStore (CAS objects/<2hex>/<hex>, tmp+fsync+rename, redb chunks/snapshots tables reusing IndexEntry wire layout, refcounts, typed IntegrityError on read, .tmp- sweep on open); deviation: manifest wire format is a hand-rolled fixed-width LE codec instead of bincode/postcard so encode().len() equals the S2 bench projection constants exactly (types stay serde-derivable; postcard roundtrip covered in dev test); layout constants moved to core::manifest and re-exported from core::bench |
