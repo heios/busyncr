@@ -356,10 +356,11 @@ async fn fr6_migrated_machine_continues_the_backup_set() {
     daemon.enroll_machine(&state_b, "machine-b", &mut rng).await;
     keys::import_key(&state_b, &keyfile, PASSPHRASE).unwrap();
 
-    // B backs up the unchanged tree: with A's key installed, every chunk it
-    // produces already exists on the daemon (chunk IDs hash plaintext and
-    // dedup is key-independent, but the *manifest* only decrypts — and the
-    // restored history only stays coherent — under the shared key).
+    // B backs up the unchanged tree: with A's keys installed (data key AND
+    // keyed-chunk-ID key, FR-K1), every chunk it produces hashes to the same
+    // keyed ID A stored, so it already exists on the daemon — importing the
+    // keyfile v2 is exactly what preserves this dedup continuity across the
+    // migration.
     let report_b = backup(&daemon.url, &state_b, &config.folders, chunker, 2, &mut rng).await;
     assert_eq!(
         report_b.chunks_uploaded, 0,

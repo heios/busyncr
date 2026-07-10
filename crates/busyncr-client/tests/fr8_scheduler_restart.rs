@@ -26,7 +26,7 @@ use busyncr_client::backup::{run_backup, BackupRequest};
 use busyncr_client::enroll::{self, request_enrollment, EnrollmentRequest};
 use busyncr_client::restore::{run_restore, RestoreRequest};
 use busyncr_client::run::{run_scheduler, RunRequest, SystemClock};
-use busyncr_core::chunking::{chunk_bytes, ChunkId, ChunkerConfig};
+use busyncr_core::chunking::{chunk_bytes_keyed, ChunkId, ChunkerConfig};
 use busyncr_core::scheduler::SchedulePolicy;
 use busyncr_daemon::identity::DaemonIdentity;
 use busyncr_daemon::service;
@@ -163,7 +163,14 @@ async fn fr8_daemon_restart_mid_upload_converges_and_stays_consistent() {
     std::fs::write(root.join("big.bin"), &data).unwrap();
 
     let chunker = ChunkerConfig::with_target(4096).unwrap();
-    let local_chunks: Vec<ChunkId> = chunk_bytes(&data, &chunker).iter().map(|c| c.id).collect();
+    // Recompute chunk IDs with the backup set's keyed-chunk-ID key, exactly as
+    // the backup pipeline does (FR-K1), so this set matches what the daemon
+    // actually stores.
+    let chunk_id_key = enroll::load_chunk_id_key(&state).unwrap();
+    let local_chunks: Vec<ChunkId> = chunk_bytes_keyed(&data, &chunker, &chunk_id_key)
+        .iter()
+        .map(|c| c.id)
+        .collect();
     let unique_chunks: HashSet<ChunkId> = local_chunks.iter().copied().collect();
     assert!(
         unique_chunks.len() > 200,

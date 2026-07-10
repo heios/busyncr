@@ -23,7 +23,14 @@
 //!   client-cert.pem  CA-signed client certificate
 //!   ca-cert.pem      daemon CA certificate (trust anchor)
 //!   data.key         32-byte backup-set data key      (0600 on unix)
+//!   chunk-id.key     32-byte keyed-chunk-ID key (FR-K1) (0600 on unix)
 //! ```
+//!
+//! The data key and the chunk-ID key are the backup set's two secrets: the
+//! data key encrypts chunks/manifests, the chunk-ID key keys the chunk
+//! identity hash (FR-K1). Both are created together at first enrollment and
+//! both travel in the keyfile v2 export, so a migrated machine restores
+//! *and* dedups against existing history.
 
 // `tonic::Status` alone is 176 bytes and rides inside `EnrollError`; tonic's
 // API returns it by value everywhere, so boxing at every conversion would
@@ -34,6 +41,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use busyncr_core::chunking::ChunkIdKey;
 use busyncr_core::crypto::DataKey;
 use busyncr_proto::v1::busyncr_client::BusyncrClient;
 use busyncr_proto::v1::{EnrollRequest, EnrollResponse};
@@ -61,6 +69,8 @@ pub const CLIENT_CERT_FILE: &str = "client-cert.pem";
 pub const CA_CERT_FILE: &str = "ca-cert.pem";
 /// File name of the raw backup-set data key inside the state directory.
 pub const DATA_KEY_FILE: &str = "data.key";
+/// File name of the raw keyed-chunk-ID key inside the state directory (FR-K1).
+pub const CHUNK_ID_KEY_FILE: &str = "chunk-id.key";
 
 /// Errors from enrollment and mTLS channel setup.
 #[derive(Debug, thiserror::Error)]
@@ -92,8 +102,9 @@ pub enum EnrollError {
     #[error("daemon returned an unusable enrollment response: {0}")]
     BadResponse(&'static str),
 
-    /// The persisted data key has the wrong size.
-    #[error("corrupt data key at {path}: expected 32 bytes, found {found}")]
+    /// A persisted backup-set key (data key or chunk-ID key) has the wrong
+    /// size.
+    #[error("corrupt key file at {path}: expected 32 bytes, found {found}")]
     BadDataKey {
         /// Offending key file.
         path: PathBuf,
@@ -214,31 +225,73 @@ pub fn save_identity(state_dir: &Path, identity: &EnrolledIdentity) -> Result<()
     Ok(())
 }
 
-/// Ensures the backup set's data key exists in `state_dir`, generating a
-/// fresh one from `rng` on first enrollment (FR1 "keyfile creation").
+/// Ensures the backup set's two secrets — the data key and the keyed-chunk-ID
+/// key (FR-K1) — exist in `state_dir`, generating fresh ones from `rng` on
+/// first enrollment (FR1 "keyfile creation"; both are born together per
+/// FR-K1 K1.2).
 ///
-/// Returns `true` if a new key was created, `false` if one already existed
-/// (re-enrollment after certificate loss must not rotate the data key —
-/// existing history stays decryptable, PRD §3.4).
+/// Returns `true` if a new data key was created, `false` if one already
+/// existed (re-enrollment after certificate loss must not rotate either key —
+/// existing history stays decryptable *and* keeps deduping, PRD §3.4 /
+/// FR-K1). Each key is created independently: a state dir carrying only one
+/// (e.g. after a partial write) gets the missing one filled in without
+/// disturbing the present one.
 ///
 /// # Errors
 ///
 /// [`EnrollError::Io`] on filesystem trouble, [`EnrollError::BadDataKey`] if
 /// an existing key file is malformed.
 pub fn ensure_data_key<R: CryptoRng>(state_dir: &Path, rng: &mut R) -> Result<bool, EnrollError> {
-    load_data_key(state_dir)
-        .map(|_| false)
-        .or_else(|e| match e {
-            EnrollError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(state_dir).map_err(|source| EnrollError::Io {
-                    path: state_dir.to_owned(),
-                    source,
-                })?;
-                let key = DataKey::generate(rng);
-                write_atomic(&state_dir.join(DATA_KEY_FILE), key.as_bytes(), true)?;
-                Ok(true)
-            }
-            other => Err(other),
+    let data_key_created = ensure_key_file(state_dir, DATA_KEY_FILE, rng, |r| {
+        *DataKey::generate(r).as_bytes()
+    })?;
+    // The chunk-ID key is generated with the data key but tracked separately,
+    // so its creation does not change the "data key created" return contract.
+    ensure_key_file(state_dir, CHUNK_ID_KEY_FILE, rng, |r| {
+        *ChunkIdKey::generate(r).as_bytes()
+    })?;
+    Ok(data_key_created)
+}
+
+/// Ensures a single 32-byte key file exists under `state_dir`, generating its
+/// bytes from `rng` via `make` when absent. Returns `true` if it was created.
+fn ensure_key_file<R: CryptoRng>(
+    state_dir: &Path,
+    file_name: &str,
+    rng: &mut R,
+    make: impl FnOnce(&mut R) -> [u8; 32],
+) -> Result<bool, EnrollError> {
+    let path = state_dir.join(file_name);
+    match fs::metadata(&path) {
+        Ok(_) => {
+            // Already present: validate its size but do not overwrite.
+            load_raw_key(&path).map(|_| false)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(state_dir).map_err(|source| EnrollError::Io {
+                path: state_dir.to_owned(),
+                source,
+            })?;
+            let bytes = make(rng);
+            write_atomic(&path, &bytes, true)?;
+            Ok(true)
+        }
+        Err(source) => Err(EnrollError::Io { path, source }),
+    }
+}
+
+/// Reads a 32-byte raw key file, validating its length.
+fn load_raw_key(path: &Path) -> Result<[u8; 32], EnrollError> {
+    let bytes = fs::read(path).map_err(|source| EnrollError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnrollError::BadDataKey {
+            path: path.to_owned(),
+            found: bytes.len(),
         })
 }
 
@@ -249,19 +302,21 @@ pub fn ensure_data_key<R: CryptoRng>(state_dir: &Path, rng: &mut R) -> Result<bo
 /// [`EnrollError::Io`] if the file is unreadable (including not-yet-created),
 /// [`EnrollError::BadDataKey`] if it has the wrong size.
 pub fn load_data_key(state_dir: &Path) -> Result<DataKey, EnrollError> {
-    let path = state_dir.join(DATA_KEY_FILE);
-    let bytes = fs::read(&path).map_err(|source| EnrollError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let raw: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| EnrollError::BadDataKey {
-            path,
-            found: bytes.len(),
-        })?;
-    Ok(DataKey::from_bytes(raw))
+    Ok(DataKey::from_bytes(load_raw_key(
+        &state_dir.join(DATA_KEY_FILE),
+    )?))
+}
+
+/// Loads the backup set's keyed-chunk-ID key from `state_dir` (FR-K1).
+///
+/// # Errors
+///
+/// [`EnrollError::Io`] if the file is unreadable (including not-yet-created),
+/// [`EnrollError::BadDataKey`] if it has the wrong size.
+pub fn load_chunk_id_key(state_dir: &Path) -> Result<ChunkIdKey, EnrollError> {
+    Ok(ChunkIdKey::from_bytes(load_raw_key(
+        &state_dir.join(CHUNK_ID_KEY_FILE),
+    )?))
 }
 
 /// Opens an mTLS channel to the daemon using the enrolled identity in
@@ -370,6 +425,52 @@ mod tests {
             "second call must keep the existing key"
         );
         assert_eq!(load_data_key(&state).unwrap(), key);
+    }
+
+    #[test]
+    fn chunk_id_key_created_with_data_key_and_stable() {
+        // FR-K1 K1.2: the chunk-ID key is born with the data key at enrollment
+        // and is not rotated by re-enrollment (dedup continuity).
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let mut rng = StdRng::seed_from_u64(21);
+
+        ensure_data_key(&state, &mut rng).unwrap();
+        assert!(
+            state.join(CHUNK_ID_KEY_FILE).is_file(),
+            "enrollment must create the chunk-ID key"
+        );
+        let chunk_key = load_chunk_id_key(&state).unwrap();
+        let data_key = load_data_key(&state).unwrap();
+        assert_ne!(
+            chunk_key.as_bytes(),
+            data_key.as_bytes(),
+            "the two secrets must be independent key material"
+        );
+
+        // Re-enrollment keeps both keys untouched.
+        assert!(!ensure_data_key(&state, &mut rng).unwrap());
+        assert_eq!(
+            load_chunk_id_key(&state).unwrap().as_bytes(),
+            chunk_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn missing_chunk_id_key_is_backfilled_without_touching_data_key() {
+        // A state dir that predates the chunk-ID key gets it filled in on the
+        // next ensure, and the existing data key is left exactly as-is.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let mut rng = StdRng::seed_from_u64(22);
+        ensure_data_key(&state, &mut rng).unwrap();
+        let data_key = load_data_key(&state).unwrap();
+        std::fs::remove_file(state.join(CHUNK_ID_KEY_FILE)).unwrap();
+
+        // Returns false (data key already existed) but backfills the chunk key.
+        assert!(!ensure_data_key(&state, &mut rng).unwrap());
+        assert!(state.join(CHUNK_ID_KEY_FILE).is_file());
+        assert_eq!(load_data_key(&state).unwrap(), data_key);
     }
 
     #[test]

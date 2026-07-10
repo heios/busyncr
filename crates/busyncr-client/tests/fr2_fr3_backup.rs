@@ -15,7 +15,7 @@ use std::sync::Arc;
 use busyncr_client::backup::{run_backup, BackupReport, BackupRequest};
 use busyncr_client::config::ClientConfig;
 use busyncr_client::enroll::{self, request_enrollment, EnrollmentRequest};
-use busyncr_core::chunking::{chunk_bytes, ChunkId, ChunkerConfig};
+use busyncr_core::chunking::{chunk_bytes_keyed, ChunkId, ChunkIdKey, ChunkerConfig};
 use busyncr_core::crypto::{self, BLOB_OVERHEAD};
 use busyncr_core::manifest::Manifest;
 use busyncr_daemon::identity::DaemonIdentity;
@@ -74,6 +74,9 @@ struct Fixture {
     root: PathBuf,
     config: ClientConfig,
     chunker: ChunkerConfig,
+    /// The backup set's keyed-chunk-ID key, loaded from state, so the test
+    /// can recompute chunk IDs exactly as the backup pipeline does (FR-K1).
+    chunk_id_key: ChunkIdKey,
     rng: StdRng,
 }
 
@@ -106,6 +109,7 @@ impl Fixture {
         enroll::save_identity(&state, &identity).unwrap();
         let mut rng = StdRng::seed_from_u64(4242);
         enroll::ensure_data_key(&state, &mut rng).unwrap();
+        let chunk_id_key = enroll::load_chunk_id_key(&state).unwrap();
 
         // Source tree under a root named `data` (manifest paths carry that
         // prefix).
@@ -141,6 +145,7 @@ impl Fixture {
             root,
             config,
             chunker,
+            chunk_id_key,
             rng,
         }
     }
@@ -171,7 +176,7 @@ impl Fixture {
                 } else {
                     let data = std::fs::read(&path).unwrap();
                     out.extend(
-                        chunk_bytes(&data, &self.chunker)
+                        chunk_bytes_keyed(&data, &self.chunker, &self.chunk_id_key)
                             .into_iter()
                             .map(|c| (c.id, c.len())),
                     );
@@ -282,7 +287,7 @@ async fn fr2_backup_snapshot_listed_and_manifest_describes_tree() {
     // Chunk references match an independent chunking of the source, and the
     // recorded mtimes/mode are real.
     let big = std::fs::read(fx.root.join("big.bin")).unwrap();
-    let expected_ids: Vec<ChunkId> = chunk_bytes(&big, &fx.chunker)
+    let expected_ids: Vec<ChunkId> = chunk_bytes_keyed(&big, &fx.chunker, &fx.chunk_id_key)
         .iter()
         .map(|c| c.id)
         .collect();
@@ -427,7 +432,7 @@ async fn fr2_default_chunking_backs_up_max_size_chunks() {
         .find(|f| f.path == "data/vm.img")
         .expect("vm.img must be in the manifest");
     assert_eq!(vm.size, data.len() as u64);
-    let expected_ids: Vec<ChunkId> = chunk_bytes(&data, &fx.chunker)
+    let expected_ids: Vec<ChunkId> = chunk_bytes_keyed(&data, &fx.chunker, &fx.chunk_id_key)
         .iter()
         .map(|c| c.id)
         .collect();

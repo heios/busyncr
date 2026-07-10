@@ -7,8 +7,9 @@
 //! 2. For every file in manifest order, `GetChunks` its ordered chunk-ID list
 //!    (duplicates included) and stream the blobs back in that exact order.
 //! 3. Decrypt each blob (AAD = chunk ID — a blob only opens under the ID it
-//!    was uploaded for) and recompute its plaintext [`ChunkId`], refusing any
-//!    mismatch (FR9: the client is the only party that can verify a chunk's
+//!    was uploaded for) and recompute its plaintext [`ChunkId`] with the
+//!    backup set's chunk-ID key (keyed BLAKE3, FR-K1), refusing any mismatch
+//!    (FR9: the client is the only party that can verify a chunk's
 //!    *plaintext* hash, since the daemon is zero-knowledge; see
 //!    `busyncr-daemon::store` module docs). Corruption the daemon detects on
 //!    its own stored bytes surfaces as a `DATA_LOSS` RPC status naming the
@@ -28,7 +29,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use busyncr_core::chunking::ChunkId;
+use busyncr_core::chunking::{ChunkId, ChunkIdKey};
 use busyncr_core::crypto::{self, CryptoError};
 use busyncr_core::manifest::{FileEntry, Manifest, ManifestError};
 use busyncr_proto::v1::busyncr_client::BusyncrClient;
@@ -154,6 +155,7 @@ pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, Rest
     ensure_empty_target(req.target_dir)?;
 
     let key = enroll::load_data_key(req.state_dir)?;
+    let chunk_id_key = enroll::load_chunk_id_key(req.state_dir)?;
     let mut client = enroll::connect_authenticated(req.daemon_url, req.state_dir).await?;
 
     let manifest_blob = client
@@ -174,7 +176,15 @@ pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, Rest
     };
 
     for file in &manifest.files {
-        let written = restore_file(&mut client, &key, req.target_dir, file, &mut report).await?;
+        let written = restore_file(
+            &mut client,
+            &key,
+            &chunk_id_key,
+            req.target_dir,
+            file,
+            &mut report,
+        )
+        .await?;
         if written != file.size {
             return Err(RestoreError::SizeMismatch {
                 path: file.path.clone(),
@@ -195,6 +205,7 @@ pub async fn run_restore(req: &RestoreRequest<'_>) -> Result<RestoreReport, Rest
 async fn restore_file(
     client: &mut BusyncrClient<Channel>,
     key: &busyncr_core::crypto::DataKey,
+    chunk_id_key: &ChunkIdKey,
     target_dir: &Path,
     file: &FileEntry,
     report: &mut RestoreReport,
@@ -238,7 +249,7 @@ async fn restore_file(
                 ));
             }
             let plaintext = crypto::decrypt_chunk(key, expected_id, &blob.data)?;
-            let actual_id = ChunkId::of(&plaintext);
+            let actual_id = ChunkId::keyed(chunk_id_key, &plaintext);
             if actual_id != *expected_id {
                 return Err(RestoreError::ChunkIdMismatch {
                     chunk: *expected_id,

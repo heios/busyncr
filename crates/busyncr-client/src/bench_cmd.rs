@@ -40,7 +40,12 @@ resets dedup continuity.
 
 Without --baseline, dedup figures are intra-snapshot only and understate \
 versioned savings. Point --baseline at an older copy of the same data to \
-measure real cross-version chunk overlap.";
+measure real cross-version chunk overlap.
+
+Chunk IDs here are unkeyed BLAKE3, not the keyed chunk identity the real \
+backup uses (FR-K1): the tool must run before any enrollment exists, and \
+dedup ratios are key-invariant, so the measurements carry over unchanged to \
+keyed backups.";
 
 /// Arguments for `bench-chunking`.
 #[derive(Debug, clap::Args)]

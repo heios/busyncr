@@ -8,7 +8,9 @@
 //!    component, `/`-separated on every platform.
 //! 2. Stream-chunk each file with the committed [`ChunkerConfig`] (CDC —
 //!    whole files are never held in memory) and hash every chunk to its
-//!    [`ChunkId`] (BLAKE3 of the plaintext, PRD §3.3).
+//!    [`ChunkId`] — the *keyed* BLAKE3 of the plaintext under the backup
+//!    set's chunk-ID key (FR-K1, PRD §3.3), so the daemon cannot confirm
+//!    known plaintext.
 //! 3. Dedup: batch chunk IDs through `HasChunks`; only chunks the daemon
 //!    reports missing are encrypted (XChaCha20-Poly1305, AAD = chunk ID) and
 //!    shipped via `UploadChunks` (FR3 — the transfer-size ledger in
@@ -33,7 +35,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use busyncr_core::chunking::{chunk_reader, ChunkId, ChunkerConfig, ChunkingError};
+use busyncr_core::chunking::{chunk_reader_keyed, ChunkId, ChunkerConfig, ChunkingError};
 use busyncr_core::crypto::{self, CryptoError, DataKey};
 use busyncr_core::manifest::{FileEntry, Manifest, ManifestError};
 use busyncr_proto::v1::busyncr_client::BusyncrClient;
@@ -175,6 +177,7 @@ pub async fn run_backup<R: CryptoRng>(
     rng: &mut R,
 ) -> Result<BackupReport, BackupError> {
     let key = enroll::load_data_key(req.state_dir)?;
+    let chunk_id_key = enroll::load_chunk_id_key(req.state_dir)?;
     let client = enroll::connect_authenticated(req.daemon_url, req.state_dir).await?;
 
     let specs = collect_files(req.roots)?;
@@ -215,7 +218,8 @@ pub async fn run_backup<R: CryptoRng>(
 
         let mut chunk_ids = Vec::new();
         let mut content_len = 0u64;
-        for chunk in chunk_reader(std::io::BufReader::new(file), &req.chunker) {
+        for chunk in chunk_reader_keyed(std::io::BufReader::new(file), &req.chunker, &chunk_id_key)
+        {
             let chunk = chunk?;
             content_len += chunk.len() as u64;
             chunk_ids.push(chunk.id);
