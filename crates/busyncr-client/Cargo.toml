@@ -13,6 +13,10 @@ anyhow = "1"
 busyncr-core.workspace = true
 busyncr-proto.workspace = true
 clap = { version = "4", features = ["derive"] }
+# filetime is in the AGENTS.md ask-free palette; restore (S8) uses it to set
+# a restored file's mtime cross-platform (Unix + Windows) without hand-rolled
+# platform code beyond permission bits.
+filetime = "0.2"
 rand = "0.10.2"
 # default aws_lc_rs backend matches tonic's tls-aws-lc.
 rcgen = "0.14"
@@ -36,5 +40,6 @@ tonic = { workspace = true, features = ["tls-aws-lc"] }
 ulid = "1.2"
 
 [dev-dependencies]
+blake3 = "1.8.5"
 busyncr-daemon = { path = "../busyncr-daemon" }
 tempfile = "3"

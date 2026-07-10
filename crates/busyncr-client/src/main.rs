@@ -7,7 +7,7 @@ mod bench_cmd;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use busyncr_client::{backup, config, enroll};
+use busyncr_client::{backup, config, enroll, restore};
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI.
@@ -71,6 +71,25 @@ enum Command {
         #[arg(long)]
         default_chunking: bool,
     },
+
+    /// Restore a retained snapshot to an empty directory (FR4, FR9).
+    ///
+    /// Fetches the manifest and every chunk it references, decrypts and
+    /// verifies each chunk's content address, and reassembles the tree
+    /// byte-exact including mtime and permissions. The target directory is
+    /// created if missing but must be empty either way.
+    Restore {
+        /// Path to the client TOML config (daemon URL).
+        #[arg(long)]
+        config: PathBuf,
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+        /// Snapshot ULID to restore (as printed by `backup` or `list`).
+        snapshot: String,
+        /// Target directory: created if missing, must be empty.
+        target: PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -89,6 +108,12 @@ fn main() -> std::process::ExitCode {
             state,
             default_chunking,
         } => run_backup(&config, &state, default_chunking),
+        Command::Restore {
+            config,
+            state,
+            snapshot,
+            target,
+        } => run_restore(&config, &state, &snapshot, &target),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -188,6 +213,44 @@ fn run_backup(
         "  shipped {} new chunk(s) = {} encrypted bytes; {} deduplicated; \
          manifest {} bytes (encrypted)",
         report.chunks_uploaded, report.upload_bytes, report.chunks_deduped, report.manifest_bytes
+    );
+    Ok(())
+}
+
+/// `restore` subcommand: FR4/FR9 end to end from the client side.
+fn run_restore(
+    config_path: &std::path::Path,
+    state: &std::path::Path,
+    snapshot: &str,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    let config = config::ClientConfig::load(config_path)?;
+    let snapshot_id: ulid::Ulid = snapshot
+        .parse()
+        .with_context(|| format!("{snapshot:?} is not a valid snapshot ULID"))?;
+
+    let request = restore::RestoreRequest {
+        daemon_url: &config.daemon,
+        state_dir: state,
+        snapshot_id,
+        target_dir: target,
+    };
+
+    let report = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?
+        .block_on(restore::run_restore(&request))
+        .context("restore failed")?;
+
+    println!(
+        "snapshot {} restored to {}",
+        report.snapshot_id,
+        target.display()
+    );
+    println!(
+        "  {} file(s), {} bytes written, {} chunk(s) fetched and verified",
+        report.files, report.bytes, report.chunks_fetched
     );
     Ok(())
 }

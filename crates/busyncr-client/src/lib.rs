@@ -5,3 +5,4 @@
 pub mod backup;
 pub mod config;
 pub mod enroll;
+pub mod restore;
