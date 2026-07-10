@@ -47,6 +47,13 @@ compression-benchmark mode).
 Read-only first: snapshot browser, retention grid visualization, storage
 stats, per-client health. CLI remains the control plane.
 
+## R7 — Store disk quota + tail pruning (FR-Q1)
+
+Cap the daemon store's disk footprint (`store_quota_bytes`); when exceeded,
+shed history strictly oldest-first (beyond what the retention grid already
+thinned), with a never-drop safety floor of the newest `min_snapshots`.
+Full spec: FR-Q1.md. Explicitly post-v0.1.0 by owner decision (2026-07-10).
+
 ## R6 — Restore ergonomics
 
 Single-file / subtree restore without full-snapshot download (manifest
