@@ -1,6 +1,6 @@
 # BusyNCR — Product Requirements Document
 
-Status: **Locked v1.2** (decisions finalized 2026-07-10 via wayfinder session; v1.1 adds chunk-size benchmark tool; v1.2 adds macOS as a supported client/daemon platform)
+Status: **Locked v1.3** (decisions finalized 2026-07-10 via wayfinder session; v1.1 adds chunk-size benchmark tool; v1.2 adds macOS as a supported client/daemon platform; v1.3 amends chunk identity to keyed hashing per FR-K1 and marks compression as governed by FR-C1)
 Owner: Alexander · Autonomous build: fable-driven, full spec, unattended until acceptance green
 
 ## 1. Problem
@@ -26,7 +26,7 @@ Rust (stable). Cross-platform core; Windows-specific integration behind `#[cfg(w
 
 ### 3.3 Storage: content-addressed chunk store
 - Content-defined chunking (FastCDC or equivalent rolling-hash CDC); target chunk size **selected empirically via the offline chunk-size benchmark (§3.7) before first backup**, then committed in config. Changing chunk size later resets dedup continuity (boundaries shift; old chunks stop matching) — client warns and treats it as starting a new backup set.
-- Chunk ID = BLAKE3 hash of *plaintext* chunk content (client-side, pre-encryption) → dedup across files, versions, and time.
+- Chunk ID = **keyed** BLAKE3 (`blake3::keyed_hash(chunk_id_key, plaintext)`, client-side, pre-encryption) per FR-K1 → dedup across files, versions, and time within a backup set; closes the known-plaintext confirmation channel. (`bench-chunking` stays keyless — ratios are key-invariant.)
 - A **snapshot** = manifest listing files → ordered chunk IDs + metadata (path, size, mtime, permissions).
 - Daemon stores encrypted chunks keyed by chunk ID; maintains a refcount/index.
 - **Prune = drop manifest + GC chunks with zero references.** This is O(manifest), which is what makes the retention grid cheap. GC must be safe under concurrent backup (grace period / lock).
@@ -90,7 +90,7 @@ Planned/deferred features live in ROADMAP.md. Highlights:
 - WebDAV secondary backup target with full-mirror or quota-bounded recent-history modes (R1).
 - Web UI / GUI (R5). CLI only: `busyncr-client backup|restore|list|bench-chunking|export-key|import-key|enroll`, `busyncr-daemon serve|prune|gc|enroll-token`.
 - Multi-daemon replication (R3); cloud storage backends.
-- Bandwidth throttling, compression tuning (R4; basic zstd-before-encrypt is in scope for v1).
+- Bandwidth throttling (R4). Compression: governed by FR-C1 (compression subsystem + policy simulation, phase 2, ships in v0.1.0) — supersedes the earlier "basic zstd-before-encrypt" line.
 - Cross-file rename detection heuristics (dedup already makes renames cheap).
 - macOS launchd service integration (macOS client/daemon run as plain binaries or via the scheduler `run` mode; only Windows gets native service wrapping in v1).
 

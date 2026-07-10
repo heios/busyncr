@@ -128,6 +128,70 @@ FR references point at PRD.md §4.
 
 ---
 
+## Phase 2 — FR-K1 (keyed identity) + FR-C1 (compression). Ships in v0.1.0.
+
+Specs: FR-K1.md and FR-C1.md are normative; entries below are the slice cuts.
+Same gate, same rules (AGENTS.md). Order is binding: K1 lands first — both
+FRs touch the chunk pipeline and the store format must be born final.
+
+- [ ] **K1 — Keyed chunk identity + keyfile v2 (FR-K1a–d).** Chunk ID becomes
+  blake3::keyed_hash(chunk_id_key, uncompressed plaintext) per FR-K1 §2.
+  chunk_id_key: 32-byte, generated at backup-set creation, stored in state
+  dir, carried in keyfile format v2 (magic retained, version bump; v1 import
+  fails with clear versioned error — no silent misinterpretation, no v1
+  migration path needed). Daemon/protocol untouched (IDs opaque).
+  bench-chunking stays keyless (note in --help). Tests: FR-K1a determinism/
+  key-separation; FR-K1b confirmation-attack (full store + exact plaintext +
+  wrong/no key ⇒ zero ID matches); FR-K1c full regression (FR2/3/4/5/6 green
+  with keyed IDs; migration keeps dedup continuity); FR-K1d keyfile v2
+  roundtrip + v1 rejection. Deps: v1 complete.
+
+- [ ] **C1 — Codec framing + compression policy engine (FR-C1 §2–§3).**
+  1-byte codec ID (0=raw, 1=zstd; 2–255 reserved, decoder errors on unknown)
+  prepended to plaintext before encryption; codec byte encrypted with payload.
+  Pure policy fn (chunk, phase, cfg) -> (codec_id, Cow<[u8]>) with injected
+  counters. Policies: zstd3 (default, keep iff len <= 0.95*raw); probe+zstd3
+  (lz4_flex block probe, threshold 1.02, output discarded — never stored);
+  +escalate (ratio >= 2.0 ⇒ retry zstd-9, keep smaller; MUST be phase-gated
+  off during initial full backup). Thresholds/levels config-surfaced, not
+  scattered literals. Crates: zstd (static libzstd), lz4_flex. Tests:
+  FR-C1 roundtrip incl. unknown-codec error; policy unit tests incl.
+  keep-threshold boundary; FR-C6 phase-gate unit level. Deps: K1.
+
+- [ ] **C2 — Pipeline integration (FR-C2, C4, C6, C7).** Wire policy engine
+  into backup (phase detection: first completed snapshot of the set) and
+  restore (decode codec after decrypt+verify). Tests: FR-C2 pre-compressed
+  corpus ≥99% raw, stored ≤1.01×; FR-C3 compressible corpus ≥2× smaller than
+  raw-only (golden bound from corpus); FR-C4 mixed-codec history restores
+  byte-exact, dedup hit across policy change, prune/GC unaffected; FR-C6
+  e2e counters (initial backup: zero level-9 invocations; incremental with
+  escalation: >0 for qualifying chunks); FR-C7 zero-knowledge extension
+  (codec invisible in stored blobs; document ciphertext-length leak in
+  threat-model note). Deps: C1.
+
+- [ ] **C3 — bench-chunking --compression policy simulation (FR-C5).**
+  Per FR-C1 §4: policies raw-only / zstd3-always / zstd3 / probe+zstd3 /
+  zstd3+escalate on the unique-chunk stream (single-pass guarantee holds —
+  extend FR10a accounting); per-policy stored bytes + AEAD arithmetic,
+  compression MB/s, §4.4 pipeline speed model (measured read/cdc/blake3/
+  compress + synthetic encrypt microbench; --threads; --net-mbps 50,200,1000
+  default; initial + incremental rows; incremental requires --baseline else
+  'n/a', --assume-churn labeled as assumed); §4.3 file-class diagnostics;
+  --json under compression_policies key; §4.5 recommendation heuristic in
+  --help. Tests: FR-C5a single-pass; FR-C5b sim-vs-real-backup stored bytes
+  (same zstd version ⇒ exact); FR-C5c baseline projection within ±5% of real
+  second backup; FR-C5d internal consistency (CPU floor ≤ finite-bandwidth
+  times, monotone in bandwidth). Deps: C1 (policy fn reuse), C2 (real-backup
+  comparison).
+
+- [ ] **C4 — Phase-2 acceptance sweep + docs.** Traceability: frk1_* and
+  frc*_ tests all present and green (extend the S13 scanner); README:
+  compression policy + keyed-identity user docs, config reference update;
+  CHANGELOG; threat-model section (confirmation channel closed by K1;
+  ciphertext-length leak documented per FR-C7). Full gate green. Deps: C2, C3.
+
+---
+
 ## Verification gate (every slice, run from repo root)
 
 ```
