@@ -190,6 +190,21 @@ FRs touch the chunk pipeline and the store format must be born final.
   CHANGELOG; threat-model section (confirmation channel closed by K1;
   ciphertext-length leak documented per FR-C7). Full gate green. Deps: C2, C3.
 
+- [ ] **M1 — CLI monitoring + explicit manual/auto control (FR-M1).**
+  Normative spec: FR-M1.md. (a) `auto_prune` daemon config (default true:
+  grid prune after each completed backup + daily timer; false = manual
+  `prune` only; manual always available; prune records log auto|manual).
+  (b) Live progress on client `backup`/`restore` to stderr: files, chunks
+  to-ship/shipped, bytes, MB/s, coarse ETA; TTY carriage-return line vs
+  log-safe line-per-interval; `--quiet`; `--json-progress` NDJSON; counters
+  sourced from the same byte-accounting FR3 uses. (c) `busyncr-client
+  status` (identity, committed chunk size, persisted last-backup record,
+  last N snapshots when daemon reachable) and `busyncr-daemon status`
+  (snapshot counts, unique chunks, store bytes, zero-ref chunks, last
+  prune/gc time+mode, CA fingerprint), both with `--json`, daemon-status
+  safe while serve runs. (d) README "manual vs scheduled operation"
+  subsection. Tests FR-M1a–d per FR-M1.md §4. Deps: C4.
+
 ---
 
 ## Verification gate (every slice, run from repo root)
