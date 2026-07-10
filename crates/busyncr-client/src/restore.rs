@@ -417,6 +417,21 @@ fn sanitize_path(path: &str) -> Result<PathBuf, RestoreError> {
             path: path.to_owned(),
         });
     }
+    // Splitting on `/` alone is not enough on Windows, where `\` is also a
+    // separator and `C:` / `\\server` are path prefixes. A manifest entry like
+    // `C:/x` yields a `C:` component that becomes a drive prefix, and a
+    // component containing `..\` decodes to parent-dir traversal — either would
+    // escape the restore target once joined (line ~280). Re-validate the
+    // assembled path through the platform's own parser: every component must be
+    // an ordinary name, or the path is unsafe. (On Unix `\` and `C:` are
+    // ordinary filename characters, so this leaves Unix behavior unchanged.)
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(RestoreError::UnsafePath {
+                path: path.to_owned(),
+            });
+        }
+    }
     Ok(rel)
 }
 
@@ -493,6 +508,32 @@ mod tests {
         ));
         assert!(matches!(
             sanitize_path("data//double"),
+            Err(RestoreError::UnsafePath { .. })
+        ));
+    }
+
+    // Windows-specific escape vectors: `\` is a path separator and `C:` /
+    // `\\server` are prefixes there, so a `/`-split alone would let these
+    // through and let `target_dir.join(rel)` escape the restore target. On
+    // Unix these strings are ordinary (single, normal) filenames and are
+    // accepted, so the guard is only meaningful — and only asserted — on
+    // Windows.
+    #[cfg(windows)]
+    #[test]
+    fn sanitize_path_rejects_windows_prefix_and_backslash_traversal() {
+        // Drive-letter prefix smuggled in via a `/`-separated entry.
+        assert!(matches!(
+            sanitize_path("C:/Windows/System32/evil.dll"),
+            Err(RestoreError::UnsafePath { .. })
+        ));
+        // Backslash traversal hidden inside a single `/`-component.
+        assert!(matches!(
+            sanitize_path("data\\..\\..\\escape"),
+            Err(RestoreError::UnsafePath { .. })
+        ));
+        // UNC-style prefix.
+        assert!(matches!(
+            sanitize_path("\\\\server\\share\\evil"),
             Err(RestoreError::UnsafePath { .. })
         ));
     }

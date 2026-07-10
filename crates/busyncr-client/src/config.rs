@@ -207,18 +207,30 @@ mod tests {
     #[test]
     fn load_parses_and_resolves_relative_folders() {
         let dir = tempfile::tempdir().unwrap();
+        // The "leave absolute entries untouched" contract is about paths that
+        // are absolute *on the host platform*. A bare `/absolute/other` is
+        // absolute on Unix but only drive-rooted (hence relative, per Rust) on
+        // Windows, where real configs use drive-lettered paths like the
+        // module doc's `C:/Users/...`. Pick a host-absolute literal so the
+        // assertion tests the intended behavior on both platforms.
+        #[cfg(windows)]
+        let absolute = "C:/absolute/other";
+        #[cfg(not(windows))]
+        let absolute = "/absolute/other";
         let path = write_config(
             dir.path(),
-            r#"
+            &format!(
+                r#"
 daemon = "https://127.0.0.1:47820"
-folders = ["data", "/absolute/other"]
+folders = ["data", "{absolute}"]
 chunk_target_size = "4K"
-"#,
+"#
+            ),
         );
         let config = ClientConfig::load(&path).unwrap();
         assert_eq!(config.daemon, "https://127.0.0.1:47820");
         assert_eq!(config.folders[0], dir.path().join("data"));
-        assert_eq!(config.folders[1], PathBuf::from("/absolute/other"));
+        assert_eq!(config.folders[1], PathBuf::from(absolute));
         let chunker = config.chunker(false).unwrap();
         assert_eq!(chunker.target_size(), 4096);
         assert_eq!(chunker.min_size(), 1024);
