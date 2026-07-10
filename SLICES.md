@@ -24,7 +24,7 @@ FR references point at PRD.md §4.
   bounds honored; empty file → 0 chunks; file < min → 1 chunk; streaming
   equals in-memory result. Deps: S0.
 
-- [ ] **S2 — `bench-chunking` offline sizing tool (PRD §3.7, FR10).** Client
+- [x] **S2 — `bench-chunking` offline sizing tool (PRD §3.7, FR10).** Client
   subcommand `bench-chunking <path> [--sizes 256K,512K,1M,2M,4M] [--baseline
   <path>] [--snapshots N] [--json]` (CLI via `clap`). Single read pass per
   file: bytes fanned to one chunker per candidate size; per-candidate report:
@@ -142,3 +142,4 @@ cargo test --workspace
 |-------|--------|--------|-------|
 | S0    | done   | (bootstrap) | skeleton green |
 | S1    | done   | 4e2fd84 | chunking module in core; fastcdc 4.0.1 caps sizes (min<=1MiB, target<=4MiB, max<=16MiB) — 4M-target bench candidate is the largest valid config |
+| S2    | done   | 8853148 | bench engine in core::bench + core::index (IndexEntry::WIRE_SIZE=48, S3 must reuse); deviations: default N = grid occupancy over a documented 1-year horizon (=36) since the >=16d tier is unbounded; manifest layout constants (header 28 B, per-file fixed 32 B) defined in core::bench — S3 must serialize to match; serde_json added to client (justified in Cargo.toml) for the PRD-mandated --json |
