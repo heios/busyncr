@@ -7,7 +7,9 @@ mod bench_cmd;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use busyncr_client::run::{run_scheduler, RunRequest, SystemClock};
 use busyncr_client::{backup, config, enroll, restore};
+use busyncr_core::scheduler::SchedulePolicy;
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI.
@@ -72,6 +74,38 @@ enum Command {
         default_chunking: bool,
     },
 
+    /// Run backups on a recurring jittered schedule until interrupted (FR8).
+    ///
+    /// Backs up immediately, then repeats on the configured interval
+    /// (default 3 h, PRD §3.5) with random jitter so many clients do not all
+    /// hit the daemon at the same instant. Stops cleanly on Ctrl-C (SIGINT)
+    /// or, on Unix, SIGTERM. Safe to kill and restart at any time: the next
+    /// `run` invocation always starts with an immediate backup, so time
+    /// spent stopped is caught up on restart rather than lost, and a backup
+    /// attempt that fails (daemon unreachable, daemon restarted mid-upload,
+    /// ...) is logged but never stops the schedule.
+    Run {
+        /// Path to the client TOML config (daemon URL, folders,
+        /// chunk_target_size).
+        #[arg(long)]
+        config: PathBuf,
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+        /// Accept the 1 MiB default chunk size instead of committing one
+        /// measured by bench-chunking (PRD §3.7).
+        #[arg(long)]
+        default_chunking: bool,
+        /// Nominal interval between backups, e.g. `3h`, `90m`, `5400s`
+        /// (PRD §3.5 default: 3 h).
+        #[arg(long, default_value = "3h")]
+        interval: String,
+        /// Jitter fraction applied to the interval, in `[0, 1]`
+        /// (`0.1` = the actual delay is `interval ± 10 %`).
+        #[arg(long, default_value_t = 0.1)]
+        jitter: f64,
+    },
+
     /// Restore a retained snapshot to an empty directory (FR4, FR9).
     ///
     /// Fetches the manifest and every chunk it references, decrypts and
@@ -108,6 +142,13 @@ fn main() -> std::process::ExitCode {
             state,
             default_chunking,
         } => run_backup(&config, &state, default_chunking),
+        Command::Run {
+            config,
+            state,
+            default_chunking,
+            interval,
+            jitter,
+        } => run_scheduled(&config, &state, default_chunking, &interval, jitter),
         Command::Restore {
             config,
             state,
@@ -215,6 +256,121 @@ fn run_backup(
         report.chunks_uploaded, report.upload_bytes, report.chunks_deduped, report.manifest_bytes
     );
     Ok(())
+}
+
+/// `run` subcommand: FR8 non-Windows scheduling from the client side. Wires
+/// the real wall clock and OS entropy at this binary edge; the loop itself
+/// ([`run_scheduler`]) never touches either directly.
+fn run_scheduled(
+    config_path: &std::path::Path,
+    state: &std::path::Path,
+    default_chunking: bool,
+    interval: &str,
+    jitter: f64,
+) -> anyhow::Result<()> {
+    let config = config::ClientConfig::load(config_path)?;
+    let chunker = config.chunker(default_chunking)?;
+    let interval = parse_duration(interval)?;
+    let schedule = SchedulePolicy::new(interval, jitter).with_context(|| {
+        format!("interval {interval:?} / jitter {jitter} is not a usable schedule")
+    })?;
+
+    let request = RunRequest {
+        daemon_url: &config.daemon,
+        state_dir: state,
+        roots: &config.folders,
+        chunker,
+        schedule,
+    };
+
+    println!(
+        "busyncr-client run: backing up to {} every {:?} (±{:.0}% jitter); Ctrl-C to stop",
+        config.daemon,
+        schedule.interval(),
+        schedule.jitter() * 100.0
+    );
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?
+        .block_on(async {
+            run_scheduler(
+                &request,
+                &SystemClock,
+                &mut rand::rng(),
+                Box::pin(shutdown_signal()),
+                report_tick,
+            )
+            .await;
+        });
+    Ok(())
+}
+
+/// Prints the outcome of one scheduled backup attempt. A failed attempt is
+/// logged, not fatal — the schedule keeps running (FR8).
+fn report_tick(tick: busyncr_client::run::Tick) {
+    match tick.result {
+        Ok(report) => println!(
+            "[t={}ms] snapshot {} stored: {} file(s), {} chunk(s) shipped \
+             ({} bytes), {} deduplicated",
+            tick.started_at_ms,
+            report.snapshot_id,
+            report.files,
+            report.chunks_uploaded,
+            report.upload_bytes,
+            report.chunks_deduped
+        ),
+        Err(err) => eprintln!(
+            "[t={}ms] backup attempt failed: {err:#}",
+            tick.started_at_ms
+        ),
+    }
+}
+
+/// Resolves once Ctrl-C (SIGINT) fires or, on Unix, SIGTERM does — whichever
+/// comes first — for the `run` loop's graceful shutdown (FR8).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    eprintln!("stopping scheduled backups");
+}
+
+/// Parses a duration like `3h`, `90m`, `5400s`, or plain seconds.
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let t = s.trim();
+    anyhow::ensure!(!t.is_empty(), "empty interval");
+    let last = t.chars().last().context("empty interval")?;
+    let (digits, multiplier) = match last {
+        'h' | 'H' => (&t[..t.len() - 1], 3600u64),
+        'm' | 'M' => (&t[..t.len() - 1], 60u64),
+        's' | 'S' => (&t[..t.len() - 1], 1u64),
+        _ => (t, 1u64),
+    };
+    let value: u64 = digits
+        .parse()
+        .with_context(|| format!("{s:?} is not a valid interval (e.g. 3h, 90m, 5400s)"))?;
+    let secs = value
+        .checked_mul(multiplier)
+        .context("interval overflows")?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 /// `restore` subcommand: FR4/FR9 end to end from the client side.

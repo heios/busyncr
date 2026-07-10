@@ -123,13 +123,37 @@ fn serve(store_root: PathBuf, listen: SocketAddr) -> anyhow::Result<()> {
                 busyncr_core::VERSION,
                 identity.ca_fingerprint()
             );
-            busyncr_daemon::service::serve_tls(store, identity, listener, async {
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!("shutting down");
-            })
-            .await
-            .context("gRPC server failed")
+            busyncr_daemon::service::serve_tls(store, identity, listener, shutdown_signal())
+                .await
+                .context("gRPC server failed")
         })
+}
+
+/// Resolves once Ctrl-C (SIGINT) fires or, on Unix, SIGTERM does — whichever
+/// comes first. `serve_tls` stops accepting new connections and lets
+/// in-flight RPCs finish (FR8: the daemon is a long-lived process that must
+/// shut down cleanly, not mid-write, on a normal stop/restart signal).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    eprintln!("shutting down");
 }
 
 fn enroll_token(store_root: &std::path::Path) -> anyhow::Result<()> {
