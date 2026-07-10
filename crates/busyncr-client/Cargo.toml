@@ -11,13 +11,22 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 busyncr-core.workspace = true
+busyncr-proto.workspace = true
 clap = { version = "4", features = ["derive"] }
+rand = "0.10.2"
+# default aws_lc_rs backend matches tonic's tls-aws-lc.
+rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
 # serde_json is not named in the AGENTS.md ask-free palette, but PRD §3.7
 # mandates `--json` machine-readable output; it is the serde-family JSON
 # serializer (serde itself is in the palette).
 serde_json = "1"
+# thiserror is not in the AGENTS.md ask-free palette by name, but the palette's
+# error-handling rule mandates "thiserror enums in core/library crates".
+thiserror = "2.0.18"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 
 [dev-dependencies]
-rand = "0.10.2"
+busyncr-daemon = { path = "../busyncr-daemon" }
 tempfile = "3"

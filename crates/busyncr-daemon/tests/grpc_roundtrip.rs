@@ -84,11 +84,12 @@ async fn grpc_full_roundtrip_against_real_store() {
         .map(|(id, _)| id.as_bytes().to_vec())
         .collect();
 
-    // Enroll is a defined RPC but lands in S6: must answer UNIMPLEMENTED.
+    // Enroll needs the daemon identity, which only the TLS path (S6) wires
+    // up: this insecure in-process server must answer UNIMPLEMENTED.
     let err = client
         .enroll(EnrollRequest {
             token: "tok".into(),
-            csr_der: vec![1, 2, 3],
+            csr_pem: "not a csr".into(),
         })
         .await
         .unwrap_err();

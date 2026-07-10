@@ -20,8 +20,15 @@ redb = "4.1"
 # error-handling rule mandates "thiserror enums in core/library crates".
 thiserror = "2.0.18"
 ulid = "1.2"
-tonic.workspace = true
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+# x509-parser feature: required to parse the client's PKCS#10 CSR during
+# enrollment (FR1); default aws_lc_rs backend matches tonic's tls-aws-lc.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+blake3 = "1.8.5"
+rand = "0.10.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 # tokio-stream is not named in the palette; it is the tokio project's own
 # companion crate (same org/release train as the palette's `tokio`) and is
 # required to adapt tokio primitives (mpsc receivers, TcpListener) into the

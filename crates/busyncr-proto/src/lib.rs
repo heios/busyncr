@@ -21,4 +21,11 @@ pub const CHUNK_ID_LEN: usize = 32;
 /// Byte length of a snapshot ID on the wire (raw ULID).
 pub const SNAPSHOT_ID_LEN: usize = 16;
 
+/// DNS name baked into the daemon's server certificate SAN list and used by
+/// clients as the TLS server-name override (S6, FR1).
+///
+/// Pinning a fixed logical name decouples certificate verification from
+/// whatever address the client happens to dial (IP, LAN hostname, tunnel).
+pub const TLS_SERVER_NAME: &str = "busyncr-daemon";
+
 pub use tonic;

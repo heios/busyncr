@@ -43,19 +43,22 @@ service Busyncr {
   rpc GetChunks(GetChunksRequest) returns (stream ChunkBlob);
 }
 
-// FR1 enrollment (served from S6).
+// FR1 enrollment (served from S6). Certificate material travels as PEM —
+// the same encoding both ends persist to disk and feed to their TLS stacks —
+// on the same field tags S5 reserved for it.
 message EnrollRequest {
   // One-time enrollment token printed by `busyncr-daemon enroll-token`.
   string token = 1;
-  // DER-encoded PKCS#10 certificate signing request.
-  bytes csr_der = 2;
+  // PEM-encoded PKCS#10 certificate signing request. Its Common Name is the
+  // client's enrollment name (used by `busyncr-daemon revoke <name>`).
+  string csr_pem = 2;
 }
 
 message EnrollResponse {
-  // DER-encoded client certificate signed by the daemon CA.
-  bytes cert_der = 1;
-  // DER-encoded daemon CA certificate, for the client's trust store.
-  bytes ca_cert_der = 2;
+  // PEM-encoded client certificate signed by the daemon CA.
+  string cert_pem = 1;
+  // PEM-encoded daemon CA certificate, for the client's trust store.
+  string ca_cert_pem = 2;
 }
 
 message ListSnapshotsRequest {}
