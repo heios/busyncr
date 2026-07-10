@@ -29,7 +29,8 @@ service Busyncr {
   // `already_present`.
   rpc UploadChunks(stream ChunkBlob) returns (UploadChunksResponse);
 
-  // Store a snapshot manifest. The manifest must reference only chunks the
+  // Store a snapshot manifest blob (opaque/encrypted; the daemon never
+  // decodes it). The declared chunk references must all be chunks the
   // daemon already holds (upload chunks first), and the snapshot ID must be
   // new — manifests are immutable once stored.
   rpc PutManifest(PutManifestRequest) returns (PutManifestResponse);
@@ -94,9 +95,18 @@ message UploadChunksResponse {
 }
 
 message PutManifestRequest {
-  // Serialized manifest (busyncr-core canonical encoding; encrypted from
-  // S7 onward).
+  // Serialized manifest blob. Opaque to the daemon: from S7 onward this is
+  // the busyncr-core canonical encoding sealed with XChaCha20-Poly1305 under
+  // the client-held data key (PRD §3.4 — the daemon is zero-knowledge).
   bytes manifest = 1;
+  // Raw 16-byte snapshot ULID. Carried alongside the blob because the
+  // daemon cannot decrypt `manifest` to read it out (S7).
+  bytes snapshot_id = 2;
+  // Every chunk reference in the manifest, in manifest order, duplicates
+  // included — the daemon refcounts exactly this sequence. Chunk IDs are
+  // already visible to the daemon (they key the store), so listing them
+  // leaks nothing beyond what UploadChunks/HasChunks already revealed.
+  repeated bytes chunk_ids = 3;
 }
 
 message PutManifestResponse {}

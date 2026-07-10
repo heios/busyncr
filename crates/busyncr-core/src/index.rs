@@ -13,7 +13,8 @@ use crate::chunking::ChunkId;
 /// 32-byte chunk-ID key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexEntry {
-    /// Plaintext chunk length in bytes.
+    /// Stored blob length in bytes (ciphertext length once clients encrypt
+    /// uploads, from slice S7 onward).
     pub chunk_len: u64,
     /// Number of live manifest references to the chunk (drives GC).
     pub refcount: u64,

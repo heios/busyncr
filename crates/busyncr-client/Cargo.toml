@@ -25,7 +25,15 @@ serde_json = "1"
 # error-handling rule mandates "thiserror enums in core/library crates".
 thiserror = "2.0.18"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# tokio-stream is not named in the palette; it is the tokio project's own
+# companion crate (same org/release train as the palette's `tokio`) and is
+# required to adapt an in-memory blob batch into the `Stream` tonic's
+# client-streaming UploadChunks RPC consumes (same justification as in
+# busyncr-daemon).
+tokio-stream = "0.1"
+toml = "0.9"
 tonic = { workspace = true, features = ["tls-aws-lc"] }
+ulid = "1.2"
 
 [dev-dependencies]
 busyncr-daemon = { path = "../busyncr-daemon" }

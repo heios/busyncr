@@ -7,7 +7,7 @@ mod bench_cmd;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use busyncr_client::enroll;
+use busyncr_client::{backup, config, enroll};
 use clap::{Parser, Subcommand};
 
 /// Top-level CLI.
@@ -50,6 +50,27 @@ enum Command {
         #[arg(long)]
         state: PathBuf,
     },
+
+    /// Back up the configured folders as one new snapshot (FR2, FR3).
+    ///
+    /// Walks every folder listed in the TOML config, chunks changed data
+    /// with the committed chunk size, encrypts everything client-side, and
+    /// ships only the chunks the daemon is missing. Refuses to run until a
+    /// chunk size is committed in the config (run bench-chunking first) or
+    /// --default-chunking is passed.
+    Backup {
+        /// Path to the client TOML config (daemon URL, folders,
+        /// chunk_target_size).
+        #[arg(long)]
+        config: PathBuf,
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+        /// Accept the 1 MiB default chunk size instead of committing one
+        /// measured by bench-chunking (PRD §3.7).
+        #[arg(long)]
+        default_chunking: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -63,6 +84,11 @@ fn main() -> std::process::ExitCode {
             name,
             state,
         } => run_enroll(daemon, &ca, token, name, &state),
+        Command::Backup {
+            config,
+            state,
+            default_chunking,
+        } => run_backup(&config, &state, default_chunking),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -115,5 +141,53 @@ fn run_enroll(
     } else {
         println!("existing backup data key kept (history stays decryptable)");
     }
+    Ok(())
+}
+
+/// `backup` subcommand: FR2/FR3 end to end from the client side. Injects the
+/// wall clock and OS entropy here at the binary edge; the library pipeline
+/// itself is deterministic.
+fn run_backup(
+    config_path: &std::path::Path,
+    state: &std::path::Path,
+    default_chunking: bool,
+) -> anyhow::Result<()> {
+    let config = config::ClientConfig::load(config_path)?;
+    let chunker = config.chunker(default_chunking)?;
+
+    let snapshot_id = ulid::Ulid::new();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let request = backup::BackupRequest {
+        daemon_url: &config.daemon,
+        state_dir: state,
+        roots: &config.folders,
+        chunker,
+        snapshot_id,
+        created_at,
+    };
+
+    let report = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?
+        .block_on(backup::run_backup(&request, &mut rand::rng()))
+        .context("backup failed")?;
+
+    println!(
+        "snapshot {} stored on {}",
+        report.snapshot_id, config.daemon
+    );
+    println!(
+        "  {} file(s), {} bytes scanned; {} chunk refs ({} unique)",
+        report.files, report.source_bytes, report.chunks_total, report.chunks_unique
+    );
+    println!(
+        "  shipped {} new chunk(s) = {} encrypted bytes; {} deduplicated; \
+         manifest {} bytes (encrypted)",
+        report.chunks_uploaded, report.upload_bytes, report.chunks_deduped, report.manifest_bytes
+    );
     Ok(())
 }

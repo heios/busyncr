@@ -56,6 +56,19 @@ fn test_chunks() -> Vec<(ChunkId, Vec<u8>)> {
         .collect()
 }
 
+/// Builds the S7-shaped PutManifest request: opaque blob + explicit snapshot
+/// ID and chunk references (the daemon never decodes the blob).
+fn manifest_request(manifest: &Manifest) -> PutManifestRequest {
+    PutManifestRequest {
+        manifest: manifest.encode().unwrap(),
+        snapshot_id: manifest.snapshot_id.to_bytes().to_vec(),
+        chunk_ids: manifest
+            .chunk_refs()
+            .map(|id| id.as_bytes().to_vec())
+            .collect(),
+    }
+}
+
 fn test_manifest(chunks: &[(ChunkId, Vec<u8>)]) -> Manifest {
     Manifest {
         snapshot_id: Ulid::from_parts(1_700_000_000_000, 42),
@@ -117,11 +130,9 @@ async fn grpc_full_roundtrip_against_real_store() {
     );
 
     // PutManifest before the chunks exist must be refused (referential
-    // integrity lives on the daemon).
+    // integrity lives on the daemon, via the declared chunk references).
     let err = client
-        .put_manifest(PutManifestRequest {
-            manifest: manifest.encode().unwrap(),
-        })
+        .put_manifest(manifest_request(&manifest))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
@@ -164,15 +175,11 @@ async fn grpc_full_roundtrip_against_real_store() {
 
     // Manifest roundtrip.
     client
-        .put_manifest(PutManifestRequest {
-            manifest: manifest.encode().unwrap(),
-        })
+        .put_manifest(manifest_request(&manifest))
         .await
         .unwrap();
     let err = client
-        .put_manifest(PutManifestRequest {
-            manifest: manifest.encode().unwrap(),
-        })
+        .put_manifest(manifest_request(&manifest))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::AlreadyExists, "manifests are immutable");
@@ -234,17 +241,28 @@ async fn grpc_rejects_bad_input_and_detects_corruption() {
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
 
-    // Uploading a blob whose data does not hash to its claimed ID is a
-    // client error, not accepted silently.
-    let dishonest = ChunkBlob {
-        chunk_id: ChunkId::of(b"claimed").as_bytes().to_vec(),
-        data: b"actual".to_vec(),
-    };
-    let err = client
-        .upload_chunks(tokio_stream::iter(vec![dishonest]))
+    // Chunk data is opaque to the daemon (from S7 it is ciphertext, whose
+    // bytes cannot hash to the plaintext chunk ID): a blob whose data does
+    // not hash to its ID must be accepted and returned bit-exact.
+    let opaque_id = ChunkId::of(b"the plaintext");
+    let opaque_data = b"unrelated ciphertext bytes".to_vec();
+    assert_ne!(ChunkId::of(&opaque_data), opaque_id);
+    client
+        .upload_chunks(tokio_stream::iter(vec![ChunkBlob {
+            chunk_id: opaque_id.as_bytes().to_vec(),
+            data: opaque_data.clone(),
+        }]))
         .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::InvalidArgument);
+        .unwrap();
+    let mut stream = client
+        .get_chunks(GetChunksRequest {
+            chunk_ids: vec![opaque_id.as_bytes().to_vec()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let blob = stream.next().await.unwrap().unwrap();
+    assert_eq!(blob.data, opaque_data);
 
     // Unknown snapshot and unknown chunk → NOT_FOUND.
     let err = client

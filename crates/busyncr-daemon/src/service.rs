@@ -9,11 +9,16 @@
 //! [`serve`] path remains for in-process tests only; without an identity
 //! attached, `Enroll` answers `UNIMPLEMENTED`.
 //!
+//! Chunk and manifest payloads are opaque to the daemon: since S7 they are
+//! encrypted client-side (PRD §3.4), so no handler decodes or verifies them
+//! against plaintext hashes — `PutManifest` carries the snapshot ID and the
+//! chunk-reference list as explicit request fields instead.
+//!
 //! # Status mapping
 //!
 //! | outcome                               | gRPC status          |
 //! |---------------------------------------|----------------------|
-//! | malformed chunk/snapshot ID or blob   | `INVALID_ARGUMENT`   |
+//! | malformed chunk/snapshot ID           | `INVALID_ARGUMENT`   |
 //! | chunk/snapshot not found              | `NOT_FOUND`          |
 //! | snapshot already exists               | `ALREADY_EXISTS`     |
 //! | manifest references unknown chunk     | `FAILED_PRECONDITION`|
@@ -37,7 +42,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use busyncr_core::chunking::ChunkId;
-use busyncr_core::manifest::Manifest;
 use busyncr_proto::v1::busyncr_server::{Busyncr, BusyncrServer};
 use busyncr_proto::v1::{
     ChunkBlob, EnrollRequest, EnrollResponse, GetChunksRequest, GetManifestRequest,
@@ -370,15 +374,11 @@ impl Busyncr for BusyncrService {
         while let Some(blob) = stream.next().await {
             let blob = blob?;
             let id = parse_chunk_id(&blob.chunk_id)?;
+            // The blob is opaque ciphertext (PRD §3.4): stored as-is under
+            // the client's declared chunk ID.
             let newly_stored = self
                 .blocking(move |store| store.put_chunk(id, &blob.data))
-                .await
-                // put_chunk verifies data hashes to id; a mismatch here is a
-                // client-supplied bad address, not stored-data loss.
-                .map_err(|s| match s.code() {
-                    tonic::Code::DataLoss => Status::invalid_argument(s.message().to_owned()),
-                    _ => s,
-                })?;
+                .await?;
             if newly_stored {
                 stored += 1;
             } else {
@@ -397,9 +397,20 @@ impl Busyncr for BusyncrService {
         request: Request<PutManifestRequest>,
     ) -> Result<Response<PutManifestResponse>, Status> {
         self.authenticate(peer_fingerprint(&request)).await?;
-        let manifest = Manifest::decode(&request.into_inner().manifest)
-            .map_err(|e| Status::invalid_argument(format!("manifest does not decode: {e}")))?;
-        self.blocking(move |store| store.put_manifest(&manifest))
+        let PutManifestRequest {
+            manifest,
+            snapshot_id,
+            chunk_ids,
+        } = request.into_inner();
+        // The blob is opaque (encrypted client-side, PRD §3.4): the snapshot
+        // ID and chunk references arrive as explicit fields, never by
+        // decoding the blob.
+        let snapshot = parse_snapshot_id(&snapshot_id)?;
+        let refs = chunk_ids
+            .iter()
+            .map(|b| parse_chunk_id(b))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.blocking(move |store| store.put_snapshot(snapshot, &manifest, &refs))
             .await?;
         Ok(Response::new(PutManifestResponse {}))
     }

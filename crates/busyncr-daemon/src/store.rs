@@ -8,15 +8,25 @@
 //!   objects/<first2hex>/<hex>   one file per chunk, named by its ChunkId
 //! ```
 //!
+//! Each object file is `BLAKE3(blob) (32 bytes) || blob`. Since S7 the blob
+//! is XChaCha20-Poly1305 ciphertext the daemon cannot relate to the chunk-ID
+//! key (which hashes the *plaintext*, PRD §3.3/§3.4), so on-disk integrity
+//! is anchored to a hash of the stored bytes themselves.
+//!
 //! # Index
 //!
-//! Two `redb` tables:
+//! Three `redb` tables:
 //!
 //! * `chunks`: 32-byte chunk-ID key → 16-byte value in the canonical
 //!   [`IndexEntry`] wire layout (`chunk_len` LE + `refcount` LE) — exactly
 //!   the [`IndexEntry::WIRE_SIZE`] record the bench-chunking projections
 //!   assume (PRD §3.7).
-//! * `snapshots`: 16-byte snapshot ULID key → serialized manifest blob.
+//! * `snapshots`: 16-byte snapshot ULID key → manifest blob (opaque:
+//!   encrypted client-side from S7 onward).
+//! * `snapshot_refs`: 16-byte snapshot ULID key → the snapshot's chunk
+//!   references (concatenated 32-byte chunk IDs, manifest order, duplicates
+//!   included). Kept outside the encrypted blob so prune/GC (S9) can
+//!   decrement refcounts without ever decrypting a manifest.
 //!
 //! # Atomicity & crash safety
 //!
@@ -28,9 +38,11 @@
 //!
 //! # Integrity (FR9 groundwork)
 //!
-//! Every chunk read re-hashes the blob and checks it against the chunk-ID
-//! key (plus the indexed length); any mismatch surfaces as a typed
-//! [`IntegrityError`] naming the chunk — corruption is never silent.
+//! Every chunk read checks the blob's length against the index and its
+//! BLAKE3 hash against the header written at store time; any mismatch
+//! surfaces as a typed [`IntegrityError`] naming the chunk — corruption is
+//! never silent. (End-to-end plaintext verification against the chunk ID
+//! happens on the client after decryption, where the plaintext exists.)
 
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -44,8 +56,15 @@ use ulid::Ulid;
 
 /// Chunk index table: 32-byte chunk ID → 16-byte [`IndexEntry`] wire value.
 const CHUNKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
-/// Snapshot table: 16-byte ULID → serialized manifest blob.
+/// Snapshot table: 16-byte ULID → opaque manifest blob.
 const SNAPSHOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("snapshots");
+/// Snapshot chunk-reference table: 16-byte ULID → concatenated 32-byte chunk
+/// IDs (manifest order, duplicates included). The daemon's only view of a
+/// snapshot's chunk usage once manifests are encrypted (S7).
+const SNAPSHOT_REFS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("snapshot_refs");
+
+/// Byte length of the BLAKE3-of-blob header prefixed to every object file.
+const OBJECT_HEADER_LEN: usize = 32;
 
 /// Prefix marking in-flight temporary object files; anything carrying it is
 /// invisible to reads and swept on open.
@@ -55,12 +74,13 @@ const TMP_PREFIX: &str = ".tmp-";
 /// what the index and the content address promise (FR9 groundwork).
 #[derive(Debug, thiserror::Error)]
 pub enum IntegrityError {
-    /// The blob's BLAKE3 hash does not match its chunk-ID address.
+    /// The stored bytes' BLAKE3 hash does not match the integrity header
+    /// written when the blob was stored.
     #[error("chunk {chunk} is corrupt: content hashes to {actual}")]
     HashMismatch {
         /// The chunk that failed verification.
         chunk: ChunkId,
-        /// What the stored bytes actually hash to.
+        /// What the stored bytes actually hash to (hex BLAKE3).
         actual: ChunkId,
     },
     /// The blob's length does not match the indexed chunk length.
@@ -197,6 +217,7 @@ impl ChunkStore {
         {
             txn.open_table(CHUNKS)?;
             txn.open_table(SNAPSHOTS)?;
+            txn.open_table(SNAPSHOT_REFS)?;
         }
         txn.commit()?;
 
@@ -247,27 +268,25 @@ impl ChunkStore {
         self.objects.join(&hex[..2]).join(hex)
     }
 
-    /// Stores a chunk under its content address.
+    /// Stores a chunk blob under the chunk ID the client addressed it with.
     ///
-    /// Verifies that `data` actually hashes to `id` before writing (the
-    /// address must be honest). Returns `true` if the chunk was newly
-    /// stored, `false` if it was already present (dedup no-op — the
-    /// existing blob and refcount are left untouched).
+    /// The blob is opaque: since S7 it is ciphertext whose relation to the
+    /// (plaintext-hash) chunk ID the daemon cannot check (PRD §3.4). What
+    /// the store guarantees instead is that whatever bytes were stored are
+    /// returned bit-exact or flagged — a BLAKE3 header over the blob is
+    /// written with it and re-verified on every read (FR9 groundwork).
     ///
-    /// The blob is written to a temporary file in the destination shard,
-    /// fsynced, then atomically renamed into place.
+    /// Returns `true` if the chunk was newly stored, `false` if it was
+    /// already present (dedup no-op — the existing blob and refcount are
+    /// left untouched).
+    ///
+    /// The object file is written to a temporary file in the destination
+    /// shard, fsynced, then atomically renamed into place.
     ///
     /// # Errors
     ///
-    /// Returns [`IntegrityError::HashMismatch`] (via
-    /// [`StoreError::Integrity`]) if `data` does not hash to `id`, or
-    /// [`StoreError::Io`]/[`StoreError::Index`] on storage failure.
+    /// Returns [`StoreError::Io`]/[`StoreError::Index`] on storage failure.
     pub fn put_chunk(&self, id: ChunkId, data: &[u8]) -> Result<bool, StoreError> {
-        let actual = ChunkId::of(data);
-        if actual != id {
-            return Err(IntegrityError::HashMismatch { chunk: id, actual }.into());
-        }
-
         let txn = self.db.begin_write()?;
         let newly_stored = {
             let mut chunks = txn.open_table(CHUNKS)?;
@@ -287,7 +306,8 @@ impl ChunkStore {
         Ok(newly_stored)
     }
 
-    /// Writes `data` to the object file for `id` via tmp + fsync + rename.
+    /// Writes `BLAKE3(data) || data` to the object file for `id` via
+    /// tmp + fsync + rename.
     fn write_object(&self, id: &ChunkId, data: &[u8]) -> Result<(), StoreError> {
         let final_path = self.object_path(id);
         let shard = final_path.parent().unwrap_or(&self.objects).to_path_buf();
@@ -295,8 +315,10 @@ impl ChunkStore {
 
         let tmp_path = shard.join(format!("{TMP_PREFIX}{}", Ulid::new()));
         let mut file = fs::File::create(&tmp_path).map_err(|e| StoreError::io(&tmp_path, e))?;
+        let header = blake3::hash(data);
         let write_result = file
-            .write_all(data)
+            .write_all(header.as_bytes())
+            .and_then(|()| file.write_all(data))
             .and_then(|()| file.sync_all())
             .map_err(|e| StoreError::io(&tmp_path, e));
         drop(file);
@@ -322,11 +344,11 @@ impl ChunkStore {
         }
     }
 
-    /// Loads a chunk and verifies it byte-for-byte.
+    /// Loads a chunk blob and verifies it byte-for-byte.
     ///
     /// The blob's length is checked against the index and its BLAKE3 hash
-    /// against the chunk-ID address; either mismatch is a typed
-    /// [`IntegrityError`] naming the chunk (FR9 groundwork).
+    /// against the integrity header written at store time; either mismatch
+    /// is a typed [`IntegrityError`] naming the chunk (FR9 groundwork).
     ///
     /// # Errors
     ///
@@ -337,14 +359,25 @@ impl ChunkStore {
         let entry = self.chunk_entry(id)?.ok_or(StoreError::ChunkNotFound(id))?;
 
         let path = self.object_path(&id);
-        let data = match fs::read(&path) {
-            Ok(data) => data,
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(IntegrityError::MissingBlob { chunk: id }.into());
             }
             Err(e) => return Err(StoreError::io(&path, e)),
         };
 
+        // A file shorter than the header cannot even carry its checksum:
+        // report it as the truncation it is (body length 0).
+        if raw.len() < OBJECT_HEADER_LEN {
+            return Err(IntegrityError::LengthMismatch {
+                chunk: id,
+                expected: entry.chunk_len,
+                actual: (raw.len() as u64).saturating_sub(OBJECT_HEADER_LEN as u64),
+            }
+            .into());
+        }
+        let (header, data) = raw.split_at(OBJECT_HEADER_LEN);
         if data.len() as u64 != entry.chunk_len {
             return Err(IntegrityError::LengthMismatch {
                 chunk: id,
@@ -353,11 +386,15 @@ impl ChunkStore {
             }
             .into());
         }
-        let actual = ChunkId::of(&data);
-        if actual != id {
-            return Err(IntegrityError::HashMismatch { chunk: id, actual }.into());
+        let actual = blake3::hash(data);
+        if actual.as_bytes() != header {
+            return Err(IntegrityError::HashMismatch {
+                chunk: id,
+                actual: ChunkId::from_bytes(*actual.as_bytes()),
+            }
+            .into());
         }
-        Ok(data)
+        Ok(data.to_vec())
     }
 
     /// Whether the store holds a chunk with this ID.
@@ -383,8 +420,14 @@ impl ChunkStore {
         Ok(Some(decode_entry(guard.value())))
     }
 
-    /// Stores a snapshot manifest and takes a reference on every chunk it
-    /// lists (once per occurrence, matching [`Manifest::chunk_refs`]).
+    /// Stores an opaque snapshot manifest blob together with its declared
+    /// chunk references, taking one reference per occurrence in `refs`.
+    ///
+    /// The blob is never decoded — since S7 it is encrypted client-side
+    /// (PRD §3.4), so the client declares the chunk references separately
+    /// (they are the IDs it just uploaded; the daemon sees those anyway).
+    /// `refs` is persisted so prune/GC (S9) can decrement refcounts without
+    /// decrypting anything.
     ///
     /// Atomic: if any referenced chunk is absent, nothing is stored and no
     /// refcount changes.
@@ -392,12 +435,14 @@ impl ChunkStore {
     /// # Errors
     ///
     /// [`StoreError::SnapshotExists`] if the snapshot ID is already stored;
-    /// [`StoreError::UnknownChunkRef`] if the manifest references a chunk
-    /// the store does not hold; [`ManifestError`] (via
-    /// [`StoreError::Manifest`]) if the manifest cannot be serialized.
-    pub fn put_manifest(&self, manifest: &Manifest) -> Result<(), StoreError> {
-        let blob = manifest.encode()?;
-        let snapshot = manifest.snapshot_id;
+    /// [`StoreError::UnknownChunkRef`] if `refs` names a chunk the store
+    /// does not hold.
+    pub fn put_snapshot(
+        &self,
+        snapshot: Ulid,
+        blob: &[u8],
+        refs: &[ChunkId],
+    ) -> Result<(), StoreError> {
         let key = snapshot.to_bytes();
 
         let txn = self.db.begin_write()?;
@@ -408,7 +453,7 @@ impl ChunkStore {
                 return Err(StoreError::SnapshotExists(snapshot));
             }
             let mut chunks = txn.open_table(CHUNKS)?;
-            for chunk in manifest.chunk_refs() {
+            for &chunk in refs {
                 let entry = {
                     let Some(guard) = chunks.get(chunk.as_bytes().as_slice())? else {
                         return Err(StoreError::UnknownChunkRef { snapshot, chunk });
@@ -424,18 +469,42 @@ impl ChunkStore {
                     bumped.to_wire_value().as_slice(),
                 )?;
             }
-            snapshots.insert(key.as_slice(), blob.as_slice())?;
+            let mut ref_bytes = Vec::with_capacity(refs.len() * ChunkId::LEN);
+            for chunk in refs {
+                ref_bytes.extend_from_slice(chunk.as_bytes());
+            }
+            let mut snapshot_refs = txn.open_table(SNAPSHOT_REFS)?;
+            snapshot_refs.insert(key.as_slice(), ref_bytes.as_slice())?;
+            snapshots.insert(key.as_slice(), blob)?;
         }
         txn.commit()?;
         Ok(())
     }
 
-    /// Loads and decodes a snapshot manifest.
+    /// Stores a plaintext [`Manifest`]: encodes it and records its chunk
+    /// references via [`Self::put_snapshot`].
+    ///
+    /// Test/tooling convenience — the production client sends encrypted
+    /// blobs straight to [`Self::put_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put_snapshot`], plus [`ManifestError`] (via
+    /// [`StoreError::Manifest`]) if the manifest cannot be serialized.
+    pub fn put_manifest(&self, manifest: &Manifest) -> Result<(), StoreError> {
+        let blob = manifest.encode()?;
+        let refs: Vec<ChunkId> = manifest.chunk_refs().collect();
+        self.put_snapshot(manifest.snapshot_id, &blob, &refs)
+    }
+
+    /// Loads and decodes a snapshot manifest stored in plaintext (tests /
+    /// tooling; production blobs are encrypted and only the client can
+    /// decode them — fetch those with [`Self::get_manifest_blob`]).
     ///
     /// # Errors
     ///
     /// [`StoreError::SnapshotNotFound`] if absent; [`StoreError::Manifest`]
-    /// if the stored blob does not decode.
+    /// if the stored blob does not decode (e.g. it is encrypted).
     pub fn get_manifest(&self, snapshot: Ulid) -> Result<Manifest, StoreError> {
         Ok(Manifest::decode(&self.get_manifest_blob(snapshot)?)?)
     }
@@ -475,29 +544,34 @@ impl ChunkStore {
         Ok(out)
     }
 
-    /// Deletes a snapshot: removes its manifest and drops one reference per
-    /// chunk occurrence (the inverse of [`Self::put_manifest`]). Chunk blobs
-    /// are left in place even at refcount 0 — reclaiming them is
-    /// [`Self::delete_chunk`]'s job (GC, slice S9).
+    /// Deletes a snapshot: removes its manifest blob and drops one reference
+    /// per declared chunk occurrence (the inverse of [`Self::put_snapshot`]).
+    /// References come from the `snapshot_refs` table, never from decoding
+    /// the (possibly encrypted) blob. Chunk blobs are left in place even at
+    /// refcount 0 — reclaiming them is [`Self::delete_chunk`]'s job (GC,
+    /// slice S9).
     ///
     /// # Errors
     ///
-    /// [`StoreError::SnapshotNotFound`] if absent; [`StoreError::Manifest`]
-    /// if the stored blob does not decode.
+    /// [`StoreError::SnapshotNotFound`] if absent.
     pub fn delete_snapshot(&self, snapshot: Ulid) -> Result<(), StoreError> {
         let key = snapshot.to_bytes();
         let txn = self.db.begin_write()?;
         {
             let mut snapshots = txn.open_table(SNAPSHOTS)?;
-            let blob = {
-                let guard = snapshots
-                    .remove(key.as_slice())?
-                    .ok_or(StoreError::SnapshotNotFound(snapshot))?;
-                guard.value().to_vec()
-            };
-            let manifest = Manifest::decode(&blob)?;
+            if snapshots.remove(key.as_slice())?.is_none() {
+                return Err(StoreError::SnapshotNotFound(snapshot));
+            }
+            let mut snapshot_refs = txn.open_table(SNAPSHOT_REFS)?;
+            let ref_bytes = snapshot_refs
+                .remove(key.as_slice())?
+                .map(|guard| guard.value().to_vec())
+                .unwrap_or_default();
             let mut chunks = txn.open_table(CHUNKS)?;
-            for chunk in manifest.chunk_refs() {
+            for chunk_bytes in ref_bytes.chunks_exact(ChunkId::LEN) {
+                let mut raw = [0u8; ChunkId::LEN];
+                raw.copy_from_slice(chunk_bytes);
+                let chunk = ChunkId::from_bytes(raw);
                 let entry = {
                     let Some(guard) = chunks.get(chunk.as_bytes().as_slice())? else {
                         // Index inconsistency; the reference is already gone,
@@ -658,16 +732,22 @@ mod tests {
     }
 
     #[test]
-    fn put_rejects_data_that_does_not_match_the_address() {
+    fn put_accepts_opaque_blob_under_plaintext_address() {
+        // Since S7 the uploaded bytes are ciphertext: they do NOT hash to
+        // the chunk ID (which hashes the plaintext, PRD §3.3/§3.4). The
+        // store must accept and round-trip them bit-exact anyway.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
-        let id = ChunkId::of(b"claimed content");
-        let err = store.put_chunk(id, b"different content").unwrap_err();
-        assert!(matches!(
-            err,
-            StoreError::Integrity(IntegrityError::HashMismatch { chunk, .. }) if chunk == id
-        ));
-        assert!(!store.has_chunk(id).unwrap(), "nothing must be stored");
+        let id = ChunkId::of(b"the plaintext the client chunked");
+        let ciphertext = b"utterly unrelated opaque bytes".to_vec();
+        assert_ne!(ChunkId::of(&ciphertext), id);
+
+        assert!(store.put_chunk(id, &ciphertext).unwrap());
+        assert_eq!(store.get_chunk(id).unwrap(), ciphertext);
+        assert_eq!(
+            store.chunk_entry(id).unwrap().unwrap().chunk_len,
+            ciphertext.len() as u64
+        );
     }
 
     #[test]
@@ -678,7 +758,8 @@ mod tests {
         let id = ChunkId::of(&data);
         store.put_chunk(id, &data).unwrap();
 
-        // Flip one byte in the stored object file, directly on disk.
+        // Flip one byte of the blob body in the stored object file, directly
+        // on disk (offset past the 32-byte integrity header).
         let hex = id.to_string();
         let blob_path = store.root().join("objects").join(&hex[..2]).join(&hex);
         let mut file = fs::OpenOptions::new()
@@ -720,14 +801,29 @@ mod tests {
         file.set_len(1000).unwrap();
         drop(file);
 
+        // Object file = 32-byte header + blob, so a 1000-byte file leaves a
+        // 968-byte body against the indexed 4096.
         let err = store.get_chunk(id).unwrap_err();
         assert!(matches!(
             err,
             StoreError::Integrity(IntegrityError::LengthMismatch {
                 chunk,
                 expected: 4096,
-                actual: 1000,
+                actual: 968,
             }) if chunk == id
+        ));
+
+        // Truncation below even the header is still a typed integrity error.
+        let file = fs::OpenOptions::new().write(true).open(&blob_path).unwrap();
+        file.set_len(10).unwrap();
+        drop(file);
+        assert!(matches!(
+            store.get_chunk(id).unwrap_err(),
+            StoreError::Integrity(IntegrityError::LengthMismatch {
+                expected: 4096,
+                actual: 0,
+                ..
+            })
         ));
     }
 
@@ -774,6 +870,41 @@ mod tests {
         assert_eq!(store.chunk_entry(id_a).unwrap().unwrap().refcount, 2);
         assert_eq!(store.chunk_entry(id_b).unwrap().unwrap().refcount, 1);
         assert!(store.zero_ref_chunks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn opaque_snapshot_blob_roundtrip_refcounts_and_delete_without_decoding() {
+        // S7: manifests arrive encrypted. The store must take references
+        // from the declared list, return the blob byte-exact, and be able to
+        // delete the snapshot (decrementing refcounts) without ever decoding
+        // the blob.
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let a = b"chunk a".to_vec();
+        let b = b"chunk b".to_vec();
+        let (id_a, id_b) = (ChunkId::of(&a), ChunkId::of(&b));
+        store.put_chunk(id_a, &a).unwrap();
+        store.put_chunk(id_b, &b).unwrap();
+
+        let snap = Ulid::from_parts(5, 5);
+        let opaque = b"\xde\xad\xbe\xef definitely not a decodable manifest".to_vec();
+        // id_a referenced twice, duplicates must both count.
+        store
+            .put_snapshot(snap, &opaque, &[id_a, id_b, id_a])
+            .unwrap();
+
+        assert_eq!(store.get_manifest_blob(snap).unwrap(), opaque);
+        assert!(
+            matches!(store.get_manifest(snap), Err(StoreError::Manifest(_))),
+            "an opaque blob must not decode as a manifest"
+        );
+        assert_eq!(store.chunk_entry(id_a).unwrap().unwrap().refcount, 2);
+        assert_eq!(store.chunk_entry(id_b).unwrap().unwrap().refcount, 1);
+
+        store.delete_snapshot(snap).unwrap();
+        assert_eq!(store.chunk_entry(id_a).unwrap().unwrap().refcount, 0);
+        assert_eq!(store.chunk_entry(id_b).unwrap().unwrap().refcount, 0);
+        assert!(store.list_snapshots().unwrap().is_empty());
     }
 
     #[test]
