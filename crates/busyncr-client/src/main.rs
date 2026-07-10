@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use busyncr_client::run::{run_scheduler, RunRequest, SystemClock};
 use busyncr_client::service::ServiceAction;
-use busyncr_client::{backup, config, enroll, restore, service};
+use busyncr_client::{backup, config, enroll, keys, restore, service, snapshots};
 use busyncr_core::scheduler::SchedulePolicy;
 use clap::{Parser, Subcommand};
 
@@ -137,6 +137,67 @@ enum Command {
         /// Target directory: created if missing, must be empty.
         target: PathBuf,
     },
+
+    /// List the snapshots retained on the daemon, oldest first (FR6).
+    ///
+    /// Works without the data key (snapshot IDs are not encrypted), so a
+    /// freshly migrated machine can see its history right after `enroll` —
+    /// but `restore` needs `import-key` first.
+    List {
+        /// Path to the client TOML config (daemon URL).
+        #[arg(long)]
+        config: PathBuf,
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+    },
+
+    /// Export the backup data key as a passphrase-protected keyfile (FR6).
+    ///
+    /// Store the keyfile somewhere OFF this machine (another disk, a
+    /// password manager, print-out). Together with the passphrase it is the
+    /// only way to read your backups after machine loss: enroll the new
+    /// machine, `import-key` this file, and the full history restores.
+    #[command(name = "export-key")]
+    ExportKey {
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+        /// Where to write the keyfile. Refuses to overwrite an existing
+        /// file.
+        #[arg(long)]
+        output: PathBuf,
+        /// Passphrase protecting the keyfile (Argon2id-derived). Visible in
+        /// the process list — prefer --passphrase-file or the stdin prompt.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase: Option<String>,
+        /// Read the passphrase from the first line of this file instead.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
+
+    /// Import a keyfile exported on another machine, unlocking its backup
+    /// history here (FR6 migration).
+    ///
+    /// Run after `enroll` on the new machine. An existing local data key is
+    /// preserved as `data.key.old-<n>` in the state directory, never
+    /// destroyed. A wrong passphrase changes nothing.
+    #[command(name = "import-key")]
+    ImportKey {
+        /// Client state directory (from `enroll`).
+        #[arg(long)]
+        state: PathBuf,
+        /// The keyfile produced by `export-key` on the old machine.
+        #[arg(long)]
+        keyfile: PathBuf,
+        /// Passphrase the keyfile was exported with. Visible in the process
+        /// list — prefer --passphrase-file or the stdin prompt.
+        #[arg(long, conflicts_with = "passphrase_file")]
+        passphrase: Option<String>,
+        /// Read the passphrase from the first line of this file instead.
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -169,6 +230,19 @@ fn main() -> std::process::ExitCode {
             snapshot,
             target,
         } => run_restore(&config, &state, &snapshot, &target),
+        Command::List { config, state } => run_list(&config, &state),
+        Command::ExportKey {
+            state,
+            output,
+            passphrase,
+            passphrase_file,
+        } => run_export_key(&state, &output, passphrase, passphrase_file.as_deref()),
+        Command::ImportKey {
+            state,
+            keyfile,
+            passphrase,
+            passphrase_file,
+        } => run_import_key(&state, &keyfile, passphrase, passphrase_file.as_deref()),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -214,8 +288,11 @@ fn run_enroll(
     );
     if created {
         println!(
-            "created new backup data key ({}); export a passphrase-protected \
-             copy once export-key lands (PRD §3.4)",
+            "created new backup data key ({}); run `busyncr-client export-key` \
+             NOW and store the keyfile off this machine — it is the only way \
+             to read your backups after machine loss (PRD §3.4). Migrating \
+             from an old machine instead? Run `busyncr-client import-key` \
+             with its exported keyfile.",
             state.join(enroll::DATA_KEY_FILE).display()
         );
     } else {
@@ -420,6 +497,119 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
         .checked_mul(multiplier)
         .context("interval overflows")?;
     Ok(std::time::Duration::from_secs(secs))
+}
+
+/// `list` subcommand: shows the daemon's retained snapshot history (FR6).
+fn run_list(config_path: &std::path::Path, state: &std::path::Path) -> anyhow::Result<()> {
+    let config = config::ClientConfig::load(config_path)?;
+    let entries = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?
+        .block_on(snapshots::list_snapshots(&config.daemon, state))
+        .context("listing snapshots failed")?;
+
+    if entries.is_empty() {
+        println!("no snapshots stored on {}", config.daemon);
+        return Ok(());
+    }
+    println!(
+        "{} snapshot(s) on {} (oldest first):",
+        entries.len(),
+        config.daemon
+    );
+    for entry in &entries {
+        println!(
+            "  {}  {}",
+            entry.id,
+            snapshots::format_utc_ms(entry.timestamp_ms)
+        );
+    }
+    Ok(())
+}
+
+/// Resolves the keyfile passphrase from `--passphrase`, `--passphrase-file`,
+/// or (interactively) one line read from stdin.
+fn resolve_passphrase(
+    passphrase: Option<String>,
+    passphrase_file: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
+    if let Some(p) = passphrase {
+        return Ok(p);
+    }
+    if let Some(path) = passphrase_file {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading passphrase file {}", path.display()))?;
+        let first = contents.lines().next().unwrap_or("").to_owned();
+        anyhow::ensure!(
+            !first.is_empty(),
+            "passphrase file {} is empty",
+            path.display()
+        );
+        return Ok(first);
+    }
+    eprint!("passphrase: ");
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading passphrase from stdin")?;
+    let trimmed = line.trim_end_matches(['\r', '\n']).to_owned();
+    anyhow::ensure!(!trimmed.is_empty(), "empty passphrase");
+    Ok(trimmed)
+}
+
+/// `export-key` subcommand: FR6 export half.
+fn run_export_key(
+    state: &std::path::Path,
+    output: &std::path::Path,
+    passphrase: Option<String>,
+    passphrase_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let passphrase = resolve_passphrase(passphrase, passphrase_file)?;
+    keys::export_key(
+        state,
+        output,
+        passphrase.as_bytes(),
+        &busyncr_core::crypto::KdfParams::default(),
+        &mut rand::rng(),
+    )
+    .context("exporting the keyfile failed")?;
+    println!("keyfile written to {}", output.display());
+    println!(
+        "store it (and the passphrase) OFF this machine: together they are \
+         the only way to read these backups after machine loss (PRD §3.4)"
+    );
+    Ok(())
+}
+
+/// `import-key` subcommand: FR6 import half (migration).
+fn run_import_key(
+    state: &std::path::Path,
+    keyfile: &std::path::Path,
+    passphrase: Option<String>,
+    passphrase_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let passphrase = resolve_passphrase(passphrase, passphrase_file)?;
+    let outcome = keys::import_key(state, keyfile, passphrase.as_bytes())
+        .context("importing the keyfile failed")?;
+    match outcome {
+        keys::ImportOutcome::Installed => {
+            println!("data key installed into {}", state.display());
+        }
+        keys::ImportOutcome::AlreadyCurrent => {
+            println!("data key already current — nothing to do");
+        }
+        keys::ImportOutcome::Replaced { backed_up } => {
+            println!("data key installed into {}", state.display());
+            println!(
+                "previous key preserved at {} (delete it once you are sure \
+                 nothing was backed up with it)",
+                backed_up.display()
+            );
+        }
+    }
+    println!("old history is now readable here: try `busyncr-client list`");
+    Ok(())
 }
 
 /// `restore` subcommand: FR4/FR9 end to end from the client side.

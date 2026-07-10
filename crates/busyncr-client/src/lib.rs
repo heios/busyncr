@@ -5,6 +5,8 @@
 pub mod backup;
 pub mod config;
 pub mod enroll;
+pub mod keys;
 pub mod restore;
 pub mod run;
 pub mod service;
+pub mod snapshots;

@@ -316,8 +316,9 @@ pub async fn connect_unauthenticated(
 }
 
 /// Writes `data` atomically (tmp + rename); `restrict` narrows permissions
-/// to owner-only before the rename (private key material).
-fn write_atomic(path: &Path, data: &[u8], restrict: bool) -> Result<(), EnrollError> {
+/// to owner-only before the rename (private key material). Shared with the
+/// keyfile export/import module (S12) — both write secret material.
+pub(crate) fn write_atomic(path: &Path, data: &[u8], restrict: bool) -> Result<(), EnrollError> {
     let io_err = |source| EnrollError::Io {
         path: path.to_owned(),
         source,
