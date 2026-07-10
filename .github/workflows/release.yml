@@ -113,6 +113,14 @@ jobs:
               echo "::error::$bin links non-system dylibs"; exit 1
             fi
           done
+      - name: Set up MSVC tools for CRT verification (Windows)
+        # rustc locates link.exe on its own, but the CRT check below shells out
+        # to `dumpbin`, which is not on PATH by default on the runner. This adds
+        # the MSVC developer tools (dumpbin included). x64 dumpbin can inspect
+        # the aarch64 binaries too, so the default host arch is fine for both
+        # Windows legs. Runs after the build, so it cannot alter build output.
+        if: startsWith(matrix.os, 'windows')
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Verify static CRT (Windows)
         if: startsWith(matrix.os, 'windows')
         shell: pwsh
