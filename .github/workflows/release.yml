@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+            ext: .exe
+            archive: zip
+          - os: ubuntu-latest
+            label: linux-x86_64
+            ext: ""
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release --workspace
+      - name: Package (zip, Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pkg | Out-Null
+          Copy-Item target/release/busyncr-client${{ matrix.ext }} pkg/
+          Copy-Item target/release/busyncr-daemon${{ matrix.ext }} pkg/
+          Copy-Item README.md, PRD.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath busyncr-${{ github.ref_name }}-${{ matrix.label }}.zip
+      - name: Package (tar.gz, Linux)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          mkdir -p pkg
+          cp target/release/busyncr-client target/release/busyncr-daemon README.md PRD.md pkg/
+          tar -C pkg -czf busyncr-${{ github.ref_name }}-${{ matrix.label }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: busyncr-${{ matrix.label }}
+          path: busyncr-*.zip
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: busyncr-${{ matrix.label }}-tar
+          path: busyncr-*.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create release with binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "BusyNCR ${{ github.ref_name }}" \
+            --generate-notes \
+            busyncr-*.zip busyncr-*.tar.gz
