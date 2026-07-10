@@ -19,51 +19,98 @@ jobs:
         include:
           - os: windows-latest
             label: windows-x86_64
+            target: x86_64-pc-windows-msvc
             ext: .exe
             archive: zip
+            # Static CRT: no VC++ Redistributable required on target machines.
+            rustflags: "-C target-feature=+crt-static"
           - os: ubuntu-latest
             label: linux-x86_64
+            target: x86_64-unknown-linux-musl
             ext: ""
             archive: tar.gz
+            rustflags: ""
           - os: macos-latest
             label: macos-aarch64
+            target: aarch64-apple-darwin
             ext: ""
             archive: tar.gz
+            rustflags: ""
+            deployment_target: "11.0"
           - os: macos-13
             label: macos-x86_64
+            target: x86_64-apple-darwin
             ext: ""
             archive: tar.gz
+            rustflags: ""
+            deployment_target: "10.13"
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build release binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Verify static linking (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          for bin in busyncr-client busyncr-daemon; do
+            file "target/${{ matrix.target }}/release/$bin"
+            if ldd "target/${{ matrix.target }}/release/$bin" 2>&1 | grep -vq "not a dynamic executable\|statically linked"; then
+              echo "::error::$bin is not fully static"; exit 1
+            fi
+          done
+      - name: Verify system-libs-only linking (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          for bin in busyncr-client busyncr-daemon; do
+            otool -L "target/${{ matrix.target }}/release/$bin"
+            if otool -L "target/${{ matrix.target }}/release/$bin" | tail -n +2 | grep -v "/usr/lib/\|/System/Library/"; then
+              echo "::error::$bin links non-system dylibs"; exit 1
+            fi
+          done
+      - name: Verify static CRT (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          foreach ($bin in "busyncr-client","busyncr-daemon") {
+            $imports = (dumpbin /DEPENDENTS "target/${{ matrix.target }}/release/$bin.exe" | Out-String)
+            Write-Host $imports
+            if ($imports -match "VCRUNTIME|MSVCP|api-ms-win-crt") {
+              Write-Error "$bin depends on the MSVC runtime (CRT not static)"; exit 1
+            }
+          }
+
       - name: Package (zip, Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path pkg | Out-Null
-          Copy-Item target/release/busyncr-client${{ matrix.ext }} pkg/
-          Copy-Item target/release/busyncr-daemon${{ matrix.ext }} pkg/
+          Copy-Item target/${{ matrix.target }}/release/busyncr-client${{ matrix.ext }} pkg/
+          Copy-Item target/${{ matrix.target }}/release/busyncr-daemon${{ matrix.ext }} pkg/
           Copy-Item README.md, PRD.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath busyncr-${{ github.ref_name }}-${{ matrix.label }}.zip
-      - name: Package (tar.gz, Linux)
+      - name: Package (tar.gz, unix)
         if: matrix.archive == 'tar.gz'
         run: |
           mkdir -p pkg
-          cp target/release/busyncr-client target/release/busyncr-daemon README.md PRD.md pkg/
+          cp target/${{ matrix.target }}/release/busyncr-client target/${{ matrix.target }}/release/busyncr-daemon README.md PRD.md pkg/
           tar -C pkg -czf busyncr-${{ github.ref_name }}-${{ matrix.label }}.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
           name: busyncr-${{ matrix.label }}
-          path: busyncr-*.zip
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
-        with:
-          name: busyncr-${{ matrix.label }}-tar
-          path: busyncr-*.tar.gz
-          if-no-files-found: ignore
+          path: |
+            busyncr-*.zip
+            busyncr-*.tar.gz
+          if-no-files-found: error
 
   release:
     name: Publish GitHub Release
