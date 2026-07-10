@@ -168,6 +168,7 @@ async fn backup(
         state_dir: state,
         roots,
         chunker,
+        compression: Default::default(),
         snapshot_id: Ulid::from_parts(1_700_000_000_000 + seq * 3_600_000, u128::from(seq)),
         created_at: 1_700_000_000 + (seq * 3600) as i64,
     };

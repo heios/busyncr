@@ -502,6 +502,7 @@ fn run_service_body() -> Result<(), ServiceError> {
         state_dir: &run_args.state,
         roots: &config.folders,
         chunker,
+        compression: config.compression,
         schedule,
     };
 

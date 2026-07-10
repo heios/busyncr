@@ -127,6 +127,7 @@ async fn frk1b_confirmation_attack_matches_zero_stored_ids_without_the_key() {
         state_dir: &state,
         roots: std::slice::from_ref(&root),
         chunker,
+        compression: Default::default(),
         snapshot_id: Ulid::from_parts(1_700_000_000_000, 1),
         created_at: 1_700_000_000,
     };
@@ -221,6 +222,7 @@ async fn frk1b_distinct_keys_do_not_share_chunk_identity() {
         state_dir: &state_a,
         roots: std::slice::from_ref(&root),
         chunker,
+        compression: Default::default(),
         snapshot_id: Ulid::from_parts(1_700_000_000_000, 7),
         created_at: 1_700_000_000,
     };
@@ -301,6 +303,7 @@ async fn frk1_store_holds_keyed_ids_not_plain_blake3() {
             state_dir: &state,
             roots: std::slice::from_ref(&root),
             chunker,
+            compression: Default::default(),
             snapshot_id: Ulid::from_parts(1_700_000_000_000, 3),
             created_at: 1_700_000_000,
         },

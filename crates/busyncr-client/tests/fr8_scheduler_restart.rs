@@ -190,6 +190,7 @@ async fn fr8_daemon_restart_mid_upload_converges_and_stays_consistent() {
                 state_dir: &state,
                 roots: &[root],
                 chunker,
+                compression: Default::default(),
                 snapshot_id: Ulid::from_parts(1, 1),
                 created_at: 1_700_000_000,
             };
@@ -259,6 +260,7 @@ async fn fr8_daemon_restart_mid_upload_converges_and_stays_consistent() {
         state_dir: &state,
         roots: std::slice::from_ref(&root),
         chunker,
+        compression: Default::default(),
         snapshot_id: Ulid::from_parts(2, 2),
         created_at: 1_700_000_100,
     };
@@ -370,6 +372,7 @@ async fn fr8_client_run_scheduler_survives_restart() {
         state_dir: &state,
         roots: std::slice::from_ref(&root),
         chunker: ChunkerConfig::with_target(4096).unwrap(),
+        compression: Default::default(),
         schedule,
     };
 

@@ -137,6 +137,7 @@ impl Harness {
             state_dir: &self.state,
             roots: &self.config.folders,
             chunker: self.config.chunker(false).unwrap(),
+            compression: Default::default(),
             snapshot_id,
             created_at: time_ms / 1000,
         };

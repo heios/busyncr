@@ -12,13 +12,25 @@
 //!    set's chunk-ID key (FR-K1, PRD §3.3), so the daemon cannot confirm
 //!    known plaintext.
 //! 3. Dedup: batch chunk IDs through `HasChunks`; only chunks the daemon
-//!    reports missing are encrypted (XChaCha20-Poly1305, AAD = chunk ID) and
-//!    shipped via `UploadChunks` (FR3 — the transfer-size ledger in
-//!    [`BackupReport`] counts exactly these ciphertext bytes).
+//!    reports missing run through the compression policy engine
+//!    ([`choose_codec`], FR-C1 §3 — each unique chunk is compressed at most
+//!    once, ever, per C1.3: dedup happens before compression), are framed
+//!    with their codec byte ([`frame`], C1.1), encrypted
+//!    (XChaCha20-Poly1305, AAD = chunk ID) and shipped via `UploadChunks`
+//!    (FR3 — the transfer-size ledger in [`BackupReport`] counts exactly
+//!    these ciphertext bytes).
 //! 4. Encode the [`Manifest`], encrypt it under the data key (AAD = snapshot
 //!    ULID), and `PutManifest` with the snapshot ID and chunk references as
 //!    explicit fields — the daemon never sees the manifest plaintext
 //!    (PRD §3.4).
+//!
+//! **Compression phase detection (FR-C1 C2.3, FR-C6).** Before chunking
+//! starts, `run_backup` asks the daemon whether this backup set already has
+//! any completed snapshots (`ListSnapshots`). An empty list means this run
+//! *is* the set's first-ever completed snapshot: [`Phase::InitialFull`],
+//! which hard-gates escalation off regardless of config (compression sits on
+//! the wall-clock critical path only during this phase). Any non-empty list
+//! means [`Phase::Incremental`].
 //!
 //! Determinism: the snapshot ID, creation time, and all randomness (nonces)
 //! are injected by the caller — this module never reads the wall clock or
@@ -36,10 +48,11 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use busyncr_core::chunking::{chunk_reader_keyed, ChunkId, ChunkerConfig, ChunkingError};
+use busyncr_core::compression::{self, Phase, PolicyConfig, PolicyCounters};
 use busyncr_core::crypto::{self, CryptoError, DataKey};
 use busyncr_core::manifest::{FileEntry, Manifest, ManifestError};
 use busyncr_proto::v1::busyncr_client::BusyncrClient;
-use busyncr_proto::v1::{ChunkBlob, HasChunksRequest, PutManifestRequest};
+use busyncr_proto::v1::{ChunkBlob, HasChunksRequest, ListSnapshotsRequest, PutManifestRequest};
 use rand::CryptoRng;
 use tonic::transport::Channel;
 use ulid::Ulid;
@@ -124,6 +137,11 @@ pub struct BackupRequest<'a> {
     pub roots: &'a [PathBuf],
     /// The committed chunker configuration (PRD §3.7).
     pub chunker: ChunkerConfig,
+    /// The compression policy applied to newly-uploaded unique chunks
+    /// (FR-C1 §3). Escalation ([`PolicyConfig::escalate`]) is still hard
+    /// phase-gated off during this backup set's first completed snapshot
+    /// regardless of this config (see module docs).
+    pub compression: PolicyConfig,
     /// Snapshot identity for this run (injected — the CLI mints a fresh
     /// ULID, tests pass fixed ones).
     pub snapshot_id: Ulid,
@@ -155,6 +173,10 @@ pub struct BackupReport {
     pub upload_bytes: u64,
     /// Size of the encrypted manifest blob shipped via `PutManifest`.
     pub manifest_bytes: u64,
+    /// Compression policy engine counters for this run's newly-uploaded
+    /// chunks (FR-C1 C2.4 / FR-C6 — e.g. asserting zero escalation
+    /// invocations during the initial full backup).
+    pub compression: PolicyCounters,
 }
 
 /// One file scheduled for capture: where it lives and its manifest path.
@@ -178,13 +200,28 @@ pub async fn run_backup<R: CryptoRng>(
 ) -> Result<BackupReport, BackupError> {
     let key = enroll::load_data_key(req.state_dir)?;
     let chunk_id_key = enroll::load_chunk_id_key(req.state_dir)?;
-    let client = enroll::connect_authenticated(req.daemon_url, req.state_dir).await?;
+    let mut client = enroll::connect_authenticated(req.daemon_url, req.state_dir).await?;
+
+    // Phase detection (FR-C1 C2.3, module docs): this run is the backup
+    // set's first completed snapshot iff the daemon has none yet.
+    let existing = client
+        .list_snapshots(ListSnapshotsRequest {})
+        .await?
+        .into_inner();
+    let phase = if existing.snapshot_ids.is_empty() {
+        Phase::InitialFull
+    } else {
+        Phase::Incremental
+    };
 
     let specs = collect_files(req.roots)?;
 
     let mut session = Session {
         client,
         key,
+        phase,
+        policy: req.compression,
+        counters: PolicyCounters::default(),
         report: BackupReport {
             snapshot_id: req.snapshot_id,
             files: 0,
@@ -195,6 +232,7 @@ pub async fn run_backup<R: CryptoRng>(
             chunks_deduped: 0,
             upload_bytes: 0,
             manifest_bytes: 0,
+            compression: PolicyCounters::default(),
         },
     };
 
@@ -250,6 +288,7 @@ pub async fn run_backup<R: CryptoRng>(
         });
     }
     session.flush(&mut pending, rng).await?;
+    session.report.compression = session.counters;
 
     let manifest = Manifest {
         snapshot_id: req.snapshot_id,
@@ -274,17 +313,28 @@ pub async fn run_backup<R: CryptoRng>(
     Ok(session.report)
 }
 
-/// Connection + key + running ledger for one backup.
+/// Connection + key + compression policy + running ledger for one backup.
 struct Session {
     client: BusyncrClient<Channel>,
     key: DataKey,
+    /// Phase for this run's compression decisions (FR-C1 C2.3), detected
+    /// once up front — see module docs.
+    phase: Phase,
+    /// The compression policy applied to newly-uploaded chunks.
+    policy: PolicyConfig,
+    /// Running compression counters, folded into [`BackupReport::compression`]
+    /// once the run completes.
+    counters: PolicyCounters,
     report: BackupReport,
 }
 
 impl Session {
-    /// Dedups `pending` against the daemon (`HasChunks`), encrypts only the
-    /// missing chunks, ships them (`UploadChunks`), and updates the ledger.
-    /// Drains `pending` in all cases.
+    /// Dedups `pending` against the daemon (`HasChunks`), runs each missing
+    /// chunk through the compression policy engine and codec framing
+    /// (FR-C1 §2–§3 — dedup happens first, so each unique chunk is
+    /// compressed at most once ever, per C1.3), encrypts, ships them
+    /// (`UploadChunks`), and updates the ledger. Drains `pending` in all
+    /// cases.
     async fn flush<R: CryptoRng>(
         &mut self,
         pending: &mut Vec<(ChunkId, Vec<u8>)>,
@@ -316,7 +366,13 @@ impl Session {
         let mut blobs = Vec::new();
         for (id, data) in pending.drain(..) {
             if missing.contains(&id) {
-                let ciphertext = crypto::encrypt_chunk(&self.key, &id, &data, rng)?;
+                // FR-C1 §3: choose a codec for this (previously-unseen)
+                // unique chunk, frame it (C1.1), then encrypt the codec byte
+                // and payload together (C1.2, zero-knowledge preserved).
+                let (codec, payload) =
+                    compression::choose_codec(&data, self.phase, &self.policy, &mut self.counters);
+                let framed = compression::frame(codec, &payload);
+                let ciphertext = crypto::encrypt_chunk(&self.key, &id, &framed, rng)?;
                 self.report.upload_bytes += ciphertext.len() as u64;
                 self.report.chunks_uploaded += 1;
                 blobs.push(ChunkBlob {

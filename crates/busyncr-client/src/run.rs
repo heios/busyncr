@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use busyncr_core::chunking::ChunkerConfig;
+use busyncr_core::compression::PolicyConfig;
 use busyncr_core::scheduler::SchedulePolicy;
 use rand::CryptoRng;
 use ulid::Ulid;
@@ -71,6 +72,8 @@ pub struct RunRequest<'a> {
     pub roots: &'a [PathBuf],
     /// The committed chunker configuration (PRD §3.7).
     pub chunker: ChunkerConfig,
+    /// The compression policy applied to every scheduled backup (FR-C1 §3).
+    pub compression: PolicyConfig,
     /// The jittered schedule to run backups on.
     pub schedule: SchedulePolicy,
 }
@@ -114,6 +117,7 @@ pub async fn run_scheduler<C, R>(
             state_dir: req.state_dir,
             roots: req.roots,
             chunker: req.chunker,
+            compression: req.compression,
             snapshot_id: Ulid::new(),
             created_at: started_at_ms.div_euclid(1000),
         };
@@ -192,6 +196,7 @@ mod tests {
             state_dir: Path::new("/nonexistent-state"),
             roots: &[],
             chunker: ChunkerConfig::with_target(4096).unwrap(),
+            compression: PolicyConfig::default(),
             schedule,
         };
         let mut rng = StdRng::seed_from_u64(1);

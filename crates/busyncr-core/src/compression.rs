@@ -47,7 +47,7 @@ use std::borrow::Cow;
 /// `0 = raw`, `1 = zstd`. Values `2..=255` are reserved; decoding one is a
 /// hard integrity error ([`CompressionError::UnknownCodec`]), never silently
 /// treated as raw or ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum CodecId {
     /// Stored uncompressed, byte-for-byte.
@@ -201,7 +201,13 @@ pub const DEFAULT_ESCALATE_RATIO: f64 = 2.0;
 ///
 /// The default value is the baseline `zstd3` policy (C2.1): no probe, no
 /// escalation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Implements `serde::Deserialize` (container-level `#[serde(default)]`) so
+/// it can be embedded directly in the client's TOML config (FR-C1 C2.4:
+/// thresholds/levels are config-surfaced) — any field the operator omits
+/// falls back to [`PolicyConfig::default`].
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(default)]
 pub struct PolicyConfig {
     /// Enables the `probe+zstd3` policy (C2.2): an lz4 ratio probe gates
     /// whether zstd is invoked at all.

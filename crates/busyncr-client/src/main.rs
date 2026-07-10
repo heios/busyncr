@@ -322,6 +322,7 @@ fn run_backup(
         state_dir: state,
         roots: &config.folders,
         chunker,
+        compression: config.compression,
         snapshot_id,
         created_at,
     };
@@ -345,6 +346,13 @@ fn run_backup(
         "  shipped {} new chunk(s) = {} encrypted bytes; {} deduplicated; \
          manifest {} bytes (encrypted)",
         report.chunks_uploaded, report.upload_bytes, report.chunks_deduped, report.manifest_bytes
+    );
+    println!(
+        "  compression: {} raw, {} zstd3, {} escalated ({} bytes saved, per FR-C1 C2.4)",
+        report.compression.raw,
+        report.compression.zstd3,
+        report.compression.escalated,
+        report.compression.bytes_saved()
     );
     Ok(())
 }
@@ -371,6 +379,7 @@ fn run_scheduled(
         state_dir: state,
         roots: &config.folders,
         chunker,
+        compression: config.compression,
         schedule,
     };
 

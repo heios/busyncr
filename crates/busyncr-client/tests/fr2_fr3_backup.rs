@@ -16,6 +16,7 @@ use busyncr_client::backup::{run_backup, BackupReport, BackupRequest};
 use busyncr_client::config::ClientConfig;
 use busyncr_client::enroll::{self, request_enrollment, EnrollmentRequest};
 use busyncr_core::chunking::{chunk_bytes_keyed, ChunkId, ChunkIdKey, ChunkerConfig};
+use busyncr_core::compression::PolicyConfig;
 use busyncr_core::crypto::{self, BLOB_OVERHEAD};
 use busyncr_core::manifest::Manifest;
 use busyncr_daemon::identity::DaemonIdentity;
@@ -77,6 +78,11 @@ struct Fixture {
     /// The backup set's keyed-chunk-ID key, loaded from state, so the test
     /// can recompute chunk IDs exactly as the backup pipeline does (FR-K1).
     chunk_id_key: ChunkIdKey,
+    /// Compression policy applied by [`Fixture::backup`] (FR-C1 §3); tests
+    /// override it when they need to reason precisely about ciphertext size
+    /// (e.g. the max-size-chunk gRPC regression, which needs an
+    /// incompressible-in-effect policy to keep stressing the wire limit).
+    compression: PolicyConfig,
     rng: StdRng,
 }
 
@@ -146,6 +152,7 @@ impl Fixture {
             config,
             chunker,
             chunk_id_key,
+            compression: PolicyConfig::default(),
             rng,
         }
     }
@@ -157,15 +164,20 @@ impl Fixture {
             state_dir: &self.state,
             roots: &self.config.folders,
             chunker: self.chunker,
+            compression: self.compression,
             snapshot_id: Ulid::from_parts(1_700_000_000_000 + seq, u128::from(seq)),
             created_at: 1_700_000_000 + seq as i64,
         };
         run_backup(&request, &mut self.rng).await.unwrap()
     }
 
-    /// Chunk IDs (with plaintext lengths) of every file currently in the
-    /// tree, computed independently of the backup pipeline.
-    fn local_chunks(&self) -> Vec<(ChunkId, usize)> {
+    /// Chunk IDs (with plaintext bytes) of every file currently in the
+    /// tree, computed independently of the backup pipeline. Plaintext bytes
+    /// (not just lengths) are kept so `expected_upload_bytes` can recompute
+    /// the exact post-compression ciphertext length the pipeline chose
+    /// (FR-C1 §3 wired in by C2 — codec framing changes ciphertext length,
+    /// so byte-exact FR3 accounting must run the same policy engine).
+    fn local_chunks(&self) -> Vec<(ChunkId, Vec<u8>)> {
         let mut out = Vec::new();
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
@@ -178,7 +190,7 @@ impl Fixture {
                     out.extend(
                         chunk_bytes_keyed(&data, &self.chunker, &self.chunk_id_key)
                             .into_iter()
-                            .map(|c| (c.id, c.len())),
+                            .map(|c| (c.id, c.data)),
                     );
                 }
             }
@@ -220,13 +232,29 @@ impl Fixture {
 }
 
 /// Exact expected ciphertext volume for a set of chunks: every uploaded blob
-/// is plaintext + the fixed XChaCha20-Poly1305 overhead (nonce + tag).
-fn expected_upload_bytes(chunks: &[(ChunkId, usize)], ids: &HashSet<ChunkId>) -> u64 {
+/// is the codec-framed, `cfg`-compressed payload (FR-C1 §2 — a 1-byte codec
+/// ID plus the chosen payload) plus the fixed XChaCha20-Poly1305 overhead
+/// (nonce + tag). Recomputes the pipeline's own `choose_codec`/`frame` calls
+/// against the same policy the fixture actually backed up with, so the
+/// assertion stays byte-exact regardless of what that policy is.
+fn expected_upload_bytes(
+    chunks: &[(ChunkId, Vec<u8>)],
+    ids: &HashSet<ChunkId>,
+    cfg: &PolicyConfig,
+) -> u64 {
+    use busyncr_core::compression::{choose_codec, frame, Phase, PolicyCounters};
+
     let mut counted: HashSet<ChunkId> = HashSet::new();
+    let mut counters = PolicyCounters::default();
     chunks
         .iter()
         .filter(|(id, _)| ids.contains(id) && counted.insert(*id))
-        .map(|(_, len)| (len + BLOB_OVERHEAD) as u64)
+        .map(|(_, data)| {
+            // Escalation is off in every policy this file uses, so `Phase`
+            // cannot change the outcome here.
+            let (codec, payload) = choose_codec(data, Phase::Incremental, cfg, &mut counters);
+            (frame(codec, &payload).len() + BLOB_OVERHEAD) as u64
+        })
         .sum()
 }
 
@@ -256,7 +284,10 @@ async fn fr2_backup_snapshot_listed_and_manifest_describes_tree() {
         report.chunks_uploaded >= 50,
         "4K target over 300 KiB must span many chunks"
     );
-    assert_eq!(report.upload_bytes, expected_upload_bytes(&local, &unique));
+    assert_eq!(
+        report.upload_bytes,
+        expected_upload_bytes(&local, &unique, &fx.compression)
+    );
 
     // The stored manifest blob is NOT readable by the daemon (PRD §3.4)...
     let blob = fx.fetch_manifest_blob(snapshot).await;
@@ -342,7 +373,7 @@ async fn fr3_second_backup_ships_only_changed_chunks_byte_accounted() {
     assert_eq!(report2.chunks_uploaded, new_ids.len() as u64);
     assert_eq!(
         report2.upload_bytes,
-        expected_upload_bytes(&chunks_v2, &new_ids)
+        expected_upload_bytes(&chunks_v2, &new_ids, &fx.compression)
     );
     assert_eq!(
         report2.chunks_deduped + report2.chunks_uploaded,
@@ -386,13 +417,27 @@ async fn fr3_second_backup_ships_only_changed_chunks_byte_accounted() {
 async fn fr2_default_chunking_backs_up_max_size_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let mut fx = Fixture::new_default_chunking(dir.path()).await;
+    // All-zero data (needed below to force a boundary-free CDC run)
+    // compresses away to almost nothing under the default `zstd3` policy,
+    // which would defeat this test's entire point: a real >4 MiB ciphertext
+    // blob must still fit the wire. Force the raw codec unconditionally
+    // (FR-C1 C2.1's keep-threshold comparison is `compressed_len <=
+    // raw_len * keep_threshold`; `0.0` makes that condition unsatisfiable
+    // for any non-empty chunk) so this regression keeps exercising the
+    // actual worst case rather than a compression-flattered one.
+    fx.compression = PolicyConfig {
+        keep_threshold: 0.0,
+        ..PolicyConfig::default()
+    };
 
-    // 1 MiB default target → 4 MiB max chunk; its ciphertext must exceed
-    // the old 4 MiB wire limit or this test would not cover the regression.
+    // 1 MiB default target → 4 MiB max chunk; its framed+encrypted ciphertext
+    // must exceed the old 4 MiB wire limit or this test would not cover the
+    // regression (+1 for the codec byte prepended before encryption,
+    // FR-C1 C1.1).
     assert_eq!(fx.chunker.target_size(), 1024 * 1024);
     assert_eq!(fx.chunker.max_size(), 4 * 1024 * 1024);
     assert!(
-        fx.chunker.max_size() + BLOB_OVERHEAD > 4 * 1024 * 1024,
+        fx.chunker.max_size() + 1 + BLOB_OVERHEAD > 4 * 1024 * 1024,
         "max-size chunk blob must be larger than tonic's default limit"
     );
 
@@ -406,7 +451,7 @@ async fn fr2_default_chunking_backs_up_max_size_chunks() {
     let local = fx.local_chunks();
     let max_chunk = local
         .iter()
-        .find(|(_, len)| *len == fx.chunker.max_size())
+        .find(|(_, data)| data.len() == fx.chunker.max_size())
         .map(|(id, _)| *id)
         .expect("corpus must produce at least one max-size chunk");
     let unique: HashSet<ChunkId> = local.iter().map(|(id, _)| *id).collect();
@@ -418,7 +463,10 @@ async fn fr2_default_chunking_backs_up_max_size_chunks() {
     assert_eq!(report.files, 4);
     assert_eq!(report.chunks_unique, unique.len() as u64);
     assert_eq!(report.chunks_uploaded, unique.len() as u64);
-    assert_eq!(report.upload_bytes, expected_upload_bytes(&local, &unique));
+    assert_eq!(
+        report.upload_bytes,
+        expected_upload_bytes(&local, &unique, &fx.compression)
+    );
     assert_eq!(fx.list_snapshots().await, vec![report.snapshot_id]);
 
     // The manifest round-trips and records the boundary-free file exactly.
@@ -456,10 +504,11 @@ async fn fr2_default_chunking_backs_up_max_size_chunks() {
     assert_eq!(downloaded.chunk_id, max_chunk.as_bytes().to_vec());
     assert_eq!(
         downloaded.data.len(),
-        fx.chunker.max_size() + BLOB_OVERHEAD,
+        fx.chunker.max_size() + 1 + BLOB_OVERHEAD,
         "the downloaded ciphertext blob itself must exceed 4 MiB"
     );
-    let restored = crypto::decrypt_chunk(&key, &max_chunk, &downloaded.data).unwrap();
+    let framed = crypto::decrypt_chunk(&key, &max_chunk, &downloaded.data).unwrap();
+    let restored = busyncr_core::compression::decode_chunk(&framed).unwrap();
     assert_eq!(restored, vec![0u8; fx.chunker.max_size()]);
 
     fx.daemon.stop().await;

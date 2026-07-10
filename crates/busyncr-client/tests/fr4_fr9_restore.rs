@@ -171,6 +171,7 @@ impl Fixture {
             state_dir: &self.state,
             roots: &self.config.folders,
             chunker: self.chunker,
+            compression: Default::default(),
             snapshot_id: Ulid::from_parts(1_700_000_000_000 + seq, u128::from(seq)),
             created_at: 1_700_000_000 + seq as i64,
         };

@@ -17,10 +17,29 @@
 //! `backup` refuses to run and points at `bench-chunking` (PRD §3.7 —
 //! changing the size later resets dedup continuity), unless the operator
 //! passes `--default-chunking` to accept the 1 MiB default.
+//!
+//! An optional `[compression]` table configures the per-chunk compression
+//! policy engine (FR-C1 §3, C2.4 — thresholds/levels are config-surfaced,
+//! never scattered literals):
+//!
+//! ```toml
+//! [compression]
+//! use_probe = false   # probe+zstd3 (C2.2)
+//! escalate = false    # +escalate (C2.3); hard-off during the initial backup
+//! zstd_level = 3
+//! escalate_level = 9
+//! keep_threshold = 0.95
+//! probe_threshold = 1.02
+//! escalate_ratio = 2.0
+//! ```
+//!
+//! Omitting the table (or any field in it) keeps the baseline `zstd3`
+//! defaults.
 
 use std::path::{Path, PathBuf};
 
 use busyncr_core::chunking::{ChunkerConfig, ChunkingError};
+use busyncr_core::compression::PolicyConfig;
 use serde::Deserialize;
 
 /// Errors from loading or interpreting the client configuration.
@@ -87,6 +106,11 @@ pub struct ClientConfig {
     /// `None` until the operator commits one — see [`Self::chunker`].
     #[serde(default)]
     pub chunk_target_size: Option<String>,
+    /// Per-chunk compression policy (FR-C1 §3). Defaults to the baseline
+    /// `zstd3` policy (no probe, no escalation) when the `[compression]`
+    /// table is absent.
+    #[serde(default)]
+    pub compression: PolicyConfig,
 }
 
 impl ClientConfig {

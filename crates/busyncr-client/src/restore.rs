@@ -7,13 +7,20 @@
 //! 2. For every file in manifest order, `GetChunks` its ordered chunk-ID list
 //!    (duplicates included) and stream the blobs back in that exact order.
 //! 3. Decrypt each blob (AAD = chunk ID — a blob only opens under the ID it
-//!    was uploaded for) and recompute its plaintext [`ChunkId`] with the
-//!    backup set's chunk-ID key (keyed BLAKE3, FR-K1), refusing any mismatch
-//!    (FR9: the client is the only party that can verify a chunk's
-//!    *plaintext* hash, since the daemon is zero-knowledge; see
-//!    `busyncr-daemon::store` module docs). Corruption the daemon detects on
-//!    its own stored bytes surfaces as a `DATA_LOSS` RPC status naming the
-//!    chunk, which propagates here unmodified.
+//!    was uploaded for), then decode the codec-framed plaintext
+//!    ([`compression::decode_chunk`], FR-C1 §2 — the codec byte was
+//!    encrypted together with the payload, so decompression happens only
+//!    after decrypt+verify of the AEAD tag) and recompute the decompressed
+//!    plaintext's [`ChunkId`] with the backup set's chunk-ID key (keyed
+//!    BLAKE3, FR-K1; identity is always over the *uncompressed* bytes per
+//!    C1.3), refusing any mismatch (FR9: the client is the only party that
+//!    can verify a chunk's *plaintext* hash, since the daemon is
+//!    zero-knowledge; see `busyncr-daemon::store` module docs). An unknown
+//!    codec byte or a broken compressed frame is the same class of integrity
+//!    failure as a hash mismatch — a typed error naming the chunk, never
+//!    silent output. Corruption the daemon detects on its own stored bytes
+//!    surfaces as a `DATA_LOSS` RPC status naming the chunk, which
+//!    propagates here unmodified.
 //! 4. Write the reassembled bytes and restore mtime/permissions from the
 //!    manifest (FR4: byte-exact tree including metadata).
 //!
@@ -30,6 +37,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use busyncr_core::chunking::{ChunkId, ChunkIdKey};
+use busyncr_core::compression::{self, CompressionError};
 use busyncr_core::crypto::{self, CryptoError};
 use busyncr_core::manifest::{FileEntry, Manifest, ManifestError};
 use busyncr_proto::v1::busyncr_client::BusyncrClient;
@@ -99,6 +107,18 @@ pub enum RestoreError {
         chunk: ChunkId,
         /// What the decrypted plaintext actually hashes to.
         actual: ChunkId,
+    },
+
+    /// A chunk decrypted cleanly but its framed plaintext failed to decode:
+    /// an unknown codec byte or a broken compressed payload (FR-C1 §2,
+    /// FR9-class integrity failure — never silently reassembled).
+    #[error("chunk {chunk} failed to decode: {source}")]
+    CodecDecode {
+        /// The chunk ID whose decode failed.
+        chunk: ChunkId,
+        /// The underlying codec framing/decompression error.
+        #[source]
+        source: CompressionError,
     },
 
     /// A file's reassembled byte count does not match the manifest's
@@ -248,7 +268,12 @@ async fn restore_file(
                     "GetChunks streamed a chunk out of the requested order",
                 ));
             }
-            let plaintext = crypto::decrypt_chunk(key, expected_id, &blob.data)?;
+            let framed = crypto::decrypt_chunk(key, expected_id, &blob.data)?;
+            let plaintext =
+                compression::decode_chunk(&framed).map_err(|source| RestoreError::CodecDecode {
+                    chunk: *expected_id,
+                    source,
+                })?;
             let actual_id = ChunkId::keyed(chunk_id_key, &plaintext);
             if actual_id != *expected_id {
                 return Err(RestoreError::ChunkIdMismatch {
