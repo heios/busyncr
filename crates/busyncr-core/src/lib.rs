@@ -3,7 +3,9 @@
 
 #![deny(missing_docs)]
 
+pub mod bench;
 pub mod chunking;
+pub mod index;
 
 /// Crate version, re-exported for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
