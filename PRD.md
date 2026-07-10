@@ -1,6 +1,6 @@
 # BusyNCR — Product Requirements Document
 
-Status: **Locked v1.1** (decisions finalized 2026-07-10 via wayfinder session; v1.1 adds chunk-size benchmark tool)
+Status: **Locked v1.2** (decisions finalized 2026-07-10 via wayfinder session; v1.1 adds chunk-size benchmark tool; v1.2 adds macOS as a supported client/daemon platform)
 Owner: Alexander · Autonomous build: fable-driven, full spec, unattended until acceptance green
 
 ## 1. Problem
@@ -17,7 +17,7 @@ Two Rust binaries from one workspace:
 ## 3. Locked architecture decisions
 
 ### 3.1 Stack
-Rust (stable). Cross-platform core; Windows-specific integration behind `#[cfg(windows)]`. Local dev/test on Linux; Windows validation on GitHub Actions `windows-latest`.
+Rust (stable). Cross-platform core; Windows-specific integration behind `#[cfg(windows)]`. Local dev/test on Linux; Windows validation on GitHub Actions `windows-latest`; macOS validation (client + daemon binaries, both aarch64 and x86_64) on `macos-latest`/`macos-13`. macOS ships as plain binaries — launchd service integration is out of scope for v1 (see §6).
 
 ### 3.2 Transport: gRPC over TLS
 - Protocol defined in protobuf (`proto/busyncr.proto`); tonic-generated client/server stubs, prost message types.
@@ -92,6 +92,7 @@ Planned/deferred features live in ROADMAP.md. Highlights:
 - Multi-daemon replication (R3); cloud storage backends.
 - Bandwidth throttling, compression tuning (R4; basic zstd-before-encrypt is in scope for v1).
 - Cross-file rename detection heuristics (dedup already makes renames cheap).
+- macOS launchd service integration (macOS client/daemon run as plain binaries or via the scheduler `run` mode; only Windows gets native service wrapping in v1).
 
 ## 7. Development process
 

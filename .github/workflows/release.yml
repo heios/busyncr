@@ -25,6 +25,14 @@ jobs:
             label: linux-x86_64
             ext: ""
             archive: tar.gz
+          - os: macos-latest
+            label: macos-aarch64
+            ext: ""
+            archive: tar.gz
+          - os: macos-13
+            label: macos-x86_64
+            ext: ""
+            archive: tar.gz
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -26,6 +26,18 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+  macos:
+    name: macOS gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace --all-targets
+      - name: test
+        run: cargo test --workspace
+
   windows:
     name: Windows gate
     runs-on: windows-latest
