@@ -5,10 +5,9 @@ slice (see SLICES.md for the full spec each slice implements and AGENTS.md
 for the rules every entry was built under). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); dates are UTC.
 
-The project has not tagged a release yet — everything below is `[Unreleased]`
-against `0.1.0`. FR references point at PRD.md §4.
+The first tagged release is `0.1.0` (below). FR references point at PRD.md §4.
 
-## [Unreleased]
+## [0.1.0] - 2026-07-10
 
 ### C4 — Phase-2 acceptance sweep + docs
 - Extended the S13 `acceptance.rs` sweep to also cover phase-2's FR-K1.md
