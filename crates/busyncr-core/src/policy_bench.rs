@@ -748,15 +748,14 @@ fn build_incremental(kind: PolicyKind, inputs: &BuildInputs<'_>) -> Option<Incre
             simulate_policy(delta_chunks, kind, Phase::Incremental),
             ChurnSource::Measured,
         )
-    } else if let Some(percent) = inputs.assume_churn_percent {
+    } else {
+        let percent = inputs.assume_churn_percent?;
         // No real delta content exists to compress; scale the whole-corpus
         // policy result by the assumed churn fraction (explicitly labeled
         // "assumed", per FR-C1 §4.2.4).
         let whole = simulate_policy(inputs.unique_chunks, kind, Phase::Incremental);
         let scale = (percent / 100.0).clamp(0.0, 1.0);
         (scale_stats(&whole, scale), ChurnSource::Assumed { percent })
-    } else {
-        return None;
     };
 
     let delta_rate = harmonic_rate(
