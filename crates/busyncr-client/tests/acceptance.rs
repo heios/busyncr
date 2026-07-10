@@ -27,9 +27,26 @@ struct FrTest {
     location: String,
 }
 
+/// Absolute path to this very file (the scanner), resolved once so the walk
+/// can exclude it. The scanner's own regression-test fixture below
+/// (`acceptance_scanner_matches_only_true_fr_test_names`) deliberately
+/// contains the literal text `fn fr1_enrolls_successfully() {}` and
+/// `fn fr10_reads_each_file_once() {}` as sample data for the string
+/// scanner to chew on — if this file were included in the FR1-FR10 sweep
+/// below, those two literals would always register as "found", making the
+/// sweep incapable of ever detecting a missing FR1 or FR10 test. Excluding
+/// this file's own path (not just skipping string literals generically)
+/// is the simplest exclusion that cannot itself be fooled by future
+/// fixture changes.
+fn this_file_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/acceptance.rs")
+}
+
 /// Recursively collects every `fn fr<N>_...` test-function name under
-/// `dir`, skipping `target/` build output.
+/// `dir`, skipping `target/` build output and this scanner's own source
+/// file (see [`this_file_path`]).
 fn collect_fr_tests(dir: &Path, out: &mut Vec<FrTest>) {
+    let self_path = this_file_path();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // The workspace layout is fixed at repo root; a read failure here
@@ -54,6 +71,9 @@ fn collect_fr_tests(dir: &Path, out: &mut Vec<FrTest>) {
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        if path == self_path {
             continue;
         }
         let content = std::fs::read_to_string(&path)
