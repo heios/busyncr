@@ -14,7 +14,7 @@ FR references point at PRD.md §4.
   busyncr-core / busyncr-proto / busyncr-client / busyncr-daemon; GitHub
   Actions CI (linux + windows jobs); AGENTS.md gates. *(done at bootstrap)*
 
-- [ ] **S1 — CDC chunking engine.** In `busyncr-core`: `chunking` module
+- [x] **S1 — CDC chunking engine.** In `busyncr-core`: `chunking` module
   wrapping FastCDC (crate `fastcdc`) with configurable min/target/max
   (defaults min=target/4, max=target*4), streaming over any `Read` without
   loading whole files; chunk ID = BLAKE3 of chunk plaintext (crate `blake3`),
@@ -141,3 +141,4 @@ cargo test --workspace
 | Slice | Status | Commit | Notes |
 |-------|--------|--------|-------|
 | S0    | done   | (bootstrap) | skeleton green |
+| S1    | done   | 4e2fd84 | chunking module in core; fastcdc 4.0.1 caps sizes (min<=1MiB, target<=4MiB, max<=16MiB) — 4M-target bench candidate is the largest valid config |
