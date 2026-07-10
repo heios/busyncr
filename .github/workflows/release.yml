@@ -15,6 +15,7 @@ jobs:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -24,12 +25,32 @@ jobs:
             archive: zip
             # Static CRT: no VC++ Redistributable required on target machines.
             rustflags: "-C target-feature=+crt-static"
+          - os: windows-latest
+            label: windows-aarch64
+            target: aarch64-pc-windows-msvc
+            ext: .exe
+            archive: zip
+            rustflags: "-C target-feature=+crt-static"
           - os: ubuntu-latest
             label: linux-x86_64
             target: x86_64-unknown-linux-musl
             ext: ""
             archive: tar.gz
             rustflags: ""
+          - os: ubuntu-latest
+            label: linux-aarch64
+            target: aarch64-unknown-linux-musl
+            ext: ""
+            archive: tar.gz
+            rustflags: ""
+            use_cross: true
+          - os: ubuntu-latest
+            label: linux-riscv64
+            target: riscv64gc-unknown-linux-musl
+            ext: ""
+            archive: tar.gz
+            rustflags: ""
+            use_cross: true
           - os: macos-latest
             label: macos-aarch64
             target: aarch64-apple-darwin
@@ -53,19 +74,30 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install musl toolchain
+      - name: Install musl toolchain (native)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install cross
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build release binaries (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --workspace --target ${{ matrix.target }}
       - name: Build release binaries
+        if: matrix.use_cross != true
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
-      - name: Verify static linking (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      - name: Verify static linking (Linux, any arch)
+        if: contains(matrix.target, 'linux-musl')
         run: |
           for bin in busyncr-client busyncr-daemon; do
-            file "target/${{ matrix.target }}/release/$bin"
-            if ldd "target/${{ matrix.target }}/release/$bin" 2>&1 | grep -vq "not a dynamic executable\|statically linked"; then
-              echo "::error::$bin is not fully static"; exit 1
+            p="target/${{ matrix.target }}/release/$bin"
+            file "$p"
+            file "$p" | grep -Eq "statically linked|static-pie linked" || { echo "::error::$bin not reported static by file(1)"; exit 1; }
+            if readelf -l "$p" | grep -q "INTERP"; then
+              echo "::error::$bin has a dynamic interpreter (not static)"; exit 1
             fi
           done
       - name: Verify system-libs-only linking (macOS)
@@ -78,7 +110,7 @@ jobs:
             fi
           done
       - name: Verify static CRT (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(matrix.os, 'windows')
         shell: pwsh
         run: |
           foreach ($bin in "busyncr-client","busyncr-daemon") {
