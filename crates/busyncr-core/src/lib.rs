@@ -9,6 +9,7 @@ pub mod compression;
 pub mod crypto;
 pub mod index;
 pub mod manifest;
+pub mod policy_bench;
 pub mod retention;
 pub mod scheduler;
 

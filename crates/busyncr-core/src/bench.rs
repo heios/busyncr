@@ -358,7 +358,11 @@ where
 /// Recursively collects regular files under `dir`, recording each one's
 /// `/`-separated path relative to `root`. Symlinks are skipped (never
 /// followed) so cycles cannot occur.
-fn collect_files(
+///
+/// `pub(crate)`: reused by [`crate::policy_bench`], which needs the same
+/// deterministic file walk but retains full chunk bytes rather than just
+/// [`ChunkMeta`].
+pub(crate) fn collect_files(
     root: &Path,
     dir: &Path,
     out: &mut Vec<(String, PathBuf)>,
