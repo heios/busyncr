@@ -14,6 +14,8 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # Best-effort legs (matrix.optional) may fail without blocking the release.
+    continue-on-error: ${{ matrix.optional == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +53,8 @@ jobs:
             archive: tar.gz
             rustflags: ""
             use_cross: true
+            # Best-effort: published when it builds, never blocks a release.
+            optional: true
           - os: macos-latest
             label: macos-aarch64
             target: aarch64-apple-darwin
