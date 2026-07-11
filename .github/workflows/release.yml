@@ -174,13 +174,13 @@ jobs:
           New-Item -ItemType Directory -Path pkg | Out-Null
           Copy-Item target/${{ matrix.target }}/release/busyncr-client${{ matrix.ext }} pkg/
           Copy-Item target/${{ matrix.target }}/release/busyncr-daemon${{ matrix.ext }} pkg/
-          Copy-Item README.md, PRD.md pkg/
+          Copy-Item README.md, docs/PRD.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath busyncr-${{ github.ref_name }}-${{ matrix.label }}.zip
       - name: Package (tar.gz, unix)
         if: matrix.archive == 'tar.gz'
         run: |
           mkdir -p pkg
-          cp target/${{ matrix.target }}/release/busyncr-client target/${{ matrix.target }}/release/busyncr-daemon README.md PRD.md pkg/
+          cp target/${{ matrix.target }}/release/busyncr-client target/${{ matrix.target }}/release/busyncr-daemon README.md docs/PRD.md pkg/
           tar -C pkg -czf busyncr-${{ github.ref_name }}-${{ matrix.label }}.tar.gz .
       - name: Upload the archive to the release
         # Attach the single packaged archive straight to the release instead of

@@ -7,8 +7,9 @@ mTLS gRPC. Snapshots thin out over time on an exponential retention grid
 content-addressed storage. An interactive visualization of how the retention
 grid thins snapshots over time: https://heios.github.io/busyncr/visual-grid/
 
-Built autonomously, slice by slice — see PRD.md (destination), SLICES.md
-(map), AGENTS.md (rules of the road). See CHANGELOG.md for what shipped in
+Built autonomously, slice by slice — see [docs/PRD.md](docs/PRD.md)
+(destination), [docs/SLICES.md](docs/SLICES.md) (map), AGENTS.md (rules of
+the road). See [docs/CHANGELOG.md](docs/CHANGELOG.md) for what shipped in
 each slice, and docs/adr/ for the pivotal, hard-to-reverse decisions (e.g.
 [ADR-0001](docs/adr/0001-blake3-chunk-identity.md): BLAKE3 for chunk
 identity).
@@ -247,7 +248,8 @@ period, so a backup racing a GC never loses just-uploaded data (FR5).
 
 ## Compression
 
-Every new unique chunk is compressed before encryption (FR-C1.md), controlled
+Every new unique chunk is compressed before encryption
+([docs/FR-C1.md](docs/FR-C1.md)), controlled
 by an optional `[compression]` table in the client config:
 
 ```toml
@@ -350,4 +352,5 @@ statically linked as each OS allows — no runtime dependencies to install:
 | macOS | Apple Silicon (macOS 11+), Intel (10.13+) | links Apple system libraries only (ship with the OS) |
 
 Exact minimum OS versions, the full dependency inventory, and how each
-claim is mechanically verified by the release pipeline: see REQUIREMENTS.md.
+claim is mechanically verified by the release pipeline: see
+[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).

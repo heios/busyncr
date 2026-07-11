@@ -1,8 +1,10 @@
 # Agent guidelines for BusyNCR
 
-You are one of the agents autonomously building BusyNCR. Read PRD.md (the
-destination) and SLICES.md (the map) before touching code. Work ONLY on your
-assigned slice.
+You are one of the agents autonomously building BusyNCR. Read docs/PRD.md
+(the destination) and docs/SLICES.md (the map) before touching code. Work
+ONLY on your assigned slice. All project documentation (PRD, SLICES,
+REQUIREMENTS, ROADMAP, FR-*, CODING_STANDARDS, CHANGELOG, ADRs) lives under
+`docs/`; the issue backlog lives under `issues/` (see issues/README.md).
 
 ## Hard gates — a slice is not done until ALL pass from repo root
 
@@ -39,12 +41,13 @@ cargo test --workspace
 ## Process rules
 
 - One slice per agent. Do not refactor other slices' code beyond what your
-  slice requires; note wants in SLICES.md "Notes" column instead.
+  slice requires; note wants in docs/SLICES.md "Notes" column instead.
 - Commit granularity: 1–3 commits per slice, message `S<n>: <what>`.
-- Update SLICES.md: tick your checkbox and append a row to the Status log
+- Update docs/SLICES.md: tick your checkbox and append a row to the Status log
   table (slice, "done", short-hash, one-line note) in your final commit.
 - Never commit with a red gate. Never `git push` (no remote bound yet).
-- Never modify PRD.md. SLICES.md: status/notes only, specs are frozen.
+- Never modify docs/PRD.md. docs/SLICES.md: status/notes only, specs are
+  frozen.
 - If the slice spec conflicts with reality, implement the closest faithful
   version, and record the deviation in the Status log note — do not silently
   reinterpret.
