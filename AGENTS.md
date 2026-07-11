@@ -45,7 +45,8 @@ cargo test --workspace
 - Commit granularity: 1–3 commits per slice, message `S<n>: <what>`.
 - Update docs/SLICES.md: tick your checkbox and append a row to the Status log
   table (slice, "done", short-hash, one-line note) in your final commit.
-- Never commit with a red gate. Never `git push` (no remote bound yet).
+- Never commit with a red gate. Push only at the owner's request
+  (remote: github.com/heios/busyncr; pushing triggers CI).
 - Never modify docs/PRD.md. docs/SLICES.md: status/notes only, specs are
   frozen.
 - If the slice spec conflicts with reality, implement the closest faithful
