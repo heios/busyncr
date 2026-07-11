@@ -9,7 +9,9 @@ grid thins snapshots over time: https://heios.github.io/busyncr/visual-grid/
 
 Built autonomously, slice by slice — see PRD.md (destination), SLICES.md
 (map), AGENTS.md (rules of the road). See CHANGELOG.md for what shipped in
-each slice.
+each slice, and docs/adr/ for the pivotal, hard-to-reverse decisions (e.g.
+[ADR-0001](docs/adr/0001-blake3-chunk-identity.md): BLAKE3 for chunk
+identity).
 
 ## Quickstart
 
