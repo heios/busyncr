@@ -7,7 +7,7 @@ for the rules every entry was built under). Format loosely follows
 
 The first tagged release is `0.1.0` (below). FR references point at PRD.md §4.
 
-## [0.1.0] - 2026-07-10
+## [0.1.0] - 2026-07-11
 
 ### C4 — Phase-2 acceptance sweep + docs
 - Extended the S13 `acceptance.rs` sweep to also cover phase-2's FR-K1.md
@@ -241,7 +241,7 @@ The first tagged release is `0.1.0` (below). FR references point at PRD.md §4.
 
 ---
 
-v0.1.0 (unreleased) ships v1 (S0–S13) plus phase 2 (K1, C1–C4): keyed chunk
+v0.1.0 ships v1 (S0–S13) plus phase 2 (K1, C1–C4): keyed chunk
 identity and the compression subsystem are both complete and green, per
 FR-K1.md and FR-C1.md above. Still deferred, per ROADMAP.md: WebDAV
 secondary target, real-time fs-notification triggers, multi-daemon

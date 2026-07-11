@@ -91,7 +91,12 @@ jobs:
             archive: tar.gz
             rustflags: ""
             deployment_target: "11.0"
-          - os: macos-13
+          - os: macos-latest
+            # Cross-compiled to Intel from the Apple-Silicon runner: the
+            # macos-13 (x86_64) image is being retired and its jobs sit queued
+            # indefinitely. The stable Xcode toolchain ships both slices, so
+            # `cargo build --target x86_64-apple-darwin` links natively here
+            # with no `cross` needed — just the target added below.
             label: macos-x86_64
             target: x86_64-apple-darwin
             ext: ""
